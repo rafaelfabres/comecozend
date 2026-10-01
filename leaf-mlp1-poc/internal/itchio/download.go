@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"leaf-mlp1-poc/internal/leaf"
 	"leaf-mlp1-poc/internal/logger"
@@ -304,13 +307,31 @@ func (c *Client) streamToFileContext(ctx context.Context, srcURL, dest string, p
 		Jar:           c.http.Jar,
 		CheckRedirect: c.http.CheckRedirect,
 	}
+	// No overall timeout, but no waiting forever either: if no byte
+	// arrives for StallTimeout the request is cancelled. Without this a
+	// Wi-Fi drop mid-download left the read blocked indefinitely, and the
+	// screen on "Downloading..." for good.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stalled atomic.Bool
+	watchdog := time.AfterFunc(StallTimeout, func() {
+		stalled.Store(true)
+		cancel()
+	})
+	defer watchdog.Stop()
+	stallErr := func(err error) error {
+		if stalled.Load() {
+			return fmt.Errorf("%w: no data for %s", ErrDownloadStalled, StallTimeout)
+		}
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
 	if err != nil {
 		return fmt.Errorf("build file request: %w", err)
 	}
 	resp, err := dlClient.Do(req)
 	if err != nil {
-		return safeRequestError("fetch file", err)
+		return stallErr(safeRequestError("fetch file", err))
 	}
 	defer resp.Body.Close()
 
@@ -353,6 +374,7 @@ func (c *Client) streamToFileContext(ctx context.Context, srcURL, dest string, p
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			watchdog.Reset(StallTimeout)
 			if _, werr := tmp.Write(buf[:n]); werr != nil {
 				logger.Error("stream: write error after %d bytes: %v", downloaded, werr)
 				return fmt.Errorf("write: %w", werr)
@@ -367,7 +389,7 @@ func (c *Client) streamToFileContext(ctx context.Context, srcURL, dest string, p
 		}
 		if err != nil {
 			logger.Error("stream: read error after %d bytes: %v", downloaded, err)
-			return fmt.Errorf("read stream: %w", err)
+			return stallErr(fmt.Errorf("read stream: %w", err))
 		}
 	}
 	if err := tmp.Sync(); err != nil {
@@ -383,6 +405,13 @@ func (c *Client) streamToFileContext(ctx context.Context, srcURL, dest string, p
 	logger.Info("stream: done, wrote %d bytes", downloaded)
 	return nil
 }
+
+// StallTimeout is how long a download may go without receiving a byte
+// before it is abandoned. A var so tests can shorten it.
+var StallTimeout = 60 * time.Second
+
+// ErrDownloadStalled means the connection stopped delivering data.
+var ErrDownloadStalled = errors.New("download stalled")
 
 // FetchFileHeader fetches the first n bytes of a CDN URL via an HTTP Range
 // request. Falls back to reading the start of a full response when the server
