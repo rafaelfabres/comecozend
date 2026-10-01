@@ -84,6 +84,10 @@ type job struct {
 	note string // progress line, or a "cover <url>" message
 	err  error
 	done bool
+	// plan is a resolved patch, handed to the SDL thread with a
+	// "resolved" job. Workers never assign a.plan themselves: the page may
+	// have changed between the worker's last check and the assignment.
+	plan *catalog.Plan
 }
 
 func main() {
@@ -335,13 +339,22 @@ type installRun struct {
 	title  string
 	status string
 	active bool
+	plan   *catalog.Plan // the plan the install is using; never closed by the page
 }
 
-func (r *installRun) start(gameID int, title string) {
+func (r *installRun) start(plan *catalog.Plan) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.gameID, r.title, r.active = gameID, title, true
+	r.gameID, r.title, r.active = plan.Hack.GameID, plan.Hack.Title, true
+	r.plan = plan
 	r.status = "Starting..."
+}
+
+// owns reports whether a running install is using this plan.
+func (r *installRun) owns(p *catalog.Plan) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active && p != nil && r.plan == p
 }
 
 func (r *installRun) set(status string) {
@@ -354,6 +367,7 @@ func (r *installRun) finish() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.active = false
+	r.plan = nil
 }
 
 // state returns the running install's status, and whether it is this game.
@@ -973,7 +987,10 @@ func (a *ui) openDetail() {
 	}
 	h := a.shown[a.list.Cursor]
 	a.current = h
-	a.plan = nil
+	// L/R flips straight from one page to the next without leavePage, so
+	// the previous page's archive is let go here. Dropping the pointer
+	// alone left the file open and the download on the card.
+	a.releasePlan()
 	a.cover = h.Icon // the badge shows at once; better art replaces it
 	a.gallery = nil
 	if h.Icon != "" {
@@ -1217,11 +1234,11 @@ func (a *ui) resolve(parent context.Context, h catalog.Hack) {
 		plan.Close()
 		return
 	}
-	if a.plan != nil && a.plan != plan {
-		a.plan.Close()
-	}
-	a.plan = plan
-	a.jobs <- job{note: "resolved", done: true}
+	// The SDL thread decides whether this plan still belongs to the page
+	// on screen (applyJob). Checking here and assigning a.plan here left a
+	// window where the user had already moved to another hack, and A then
+	// installed the previous one.
+	a.jobs <- job{note: "resolved", done: true, plan: plan}
 }
 
 // loadArtwork asks RetroAchievements for the hack's pictures and hands the
@@ -1571,10 +1588,16 @@ func (a *ui) leavePage() {
 		a.pageCancel()
 		a.pageCancel = nil
 	}
-	if !a.running.busy() {
+	a.releasePlan()
+}
+
+// releasePlan lets go of the open page's patch archive, unless an install
+// is using it — the install closes it itself when it finishes.
+func (a *ui) releasePlan() {
+	if a.plan != nil && !a.running.owns(a.plan) {
 		a.plan.Close()
-		a.plan = nil
 	}
+	a.plan = nil
 }
 
 // stepDetail opens the hack before or after this one, keeping the list
@@ -1649,7 +1672,7 @@ func (a *ui) startInstall() {
 		a.setNotice("Another hack is being patched — wait for it to finish")
 		return
 	}
-	if a.plan == nil {
+	if a.plan == nil || a.plan.Hack.GameID != a.current.GameID {
 		// Pressing A and having nothing happen reads as a dead button.
 		// Remember the intent and start as soon as the patch resolves.
 		a.pendingInstall = a.current.GameID
@@ -1663,7 +1686,7 @@ func (a *ui) startInstall() {
 	a.pageCancel = nil
 	a.busy = true
 	plan := a.plan
-	a.running.start(plan.Hack.GameID, plan.Hack.Title)
+	a.running.start(plan)
 	a.installedGameID = plan.Hack.GameID
 	a.downloadStatus = "Starting..."
 
@@ -1865,6 +1888,18 @@ func (a *ui) applyJob(j job) {
 		a.showResolveError(j.err)
 		return
 	case "resolved":
+		if j.plan == nil {
+			return
+		}
+		if a.mode != modeDetail || j.plan.Hack.GameID != a.current.GameID {
+			// Resolved for a page that is no longer open.
+			j.plan.Close()
+			return
+		}
+		if a.plan != j.plan {
+			a.releasePlan()
+			a.plan = j.plan
+		}
 		a.showPlan()
 		return
 	case "install":

@@ -61,7 +61,8 @@ func TestOnlyOneInstallRunsAtATime(t *testing.T) {
 	if run.busy() {
 		t.Fatal("nothing should be running yet")
 	}
-	run.start(100, "First hack")
+	first := &catalog.Plan{Hack: catalog.Hack{GameID: 100, Title: "First hack"}}
+	run.start(first)
 	if !run.busy() {
 		t.Fatal("an install is running")
 	}
@@ -79,8 +80,20 @@ func TestOnlyOneInstallRunsAtATime(t *testing.T) {
 		t.Errorf("status = %q", status)
 	}
 
+	// The page must not close the archive the install is reading from,
+	// and may close any other.
+	if !run.owns(first) {
+		t.Error("the running install should own its plan")
+	}
+	if run.owns(&catalog.Plan{Hack: catalog.Hack{GameID: 100}}) {
+		t.Error("a freshly resolved plan for the same hack is not the install's")
+	}
+
 	run.finish()
 	if run.busy() {
 		t.Error("the lock should be released when the install ends")
+	}
+	if run.owns(first) {
+		t.Error("a finished install owns nothing")
 	}
 }
