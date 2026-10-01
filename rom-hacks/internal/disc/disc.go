@@ -152,13 +152,21 @@ func Extract(chdPath, dir, stem string) (Extracted, error) {
 }
 
 // WriteCue saves the .cue that came with a patch, pointing it at the
-// patched .bin.
+// patched tracks.
 //
-// The shipped cue names the hack's own bin, which is almost never what the
-// file ends up called here, so the FILE line is rewritten. A cue whose
-// FILE line points at nothing loads as an empty disc.
-func WriteCue(shippedCue []byte, destCue, binName string) error {
+// The shipped cue names the hack's own bins, which are almost never what
+// the files end up called here, so the FILE lines are rewritten: the n-th
+// FILE line gets binNames[n]. A disc with CD audio has one FILE line per
+// track, and pointing them all at the data track — as this once did —
+// produced a disc that verified (the RetroAchievements hash only reads the
+// data track) but played with its music missing. When there are more FILE
+// lines than names, the extra lines reuse the last name.
+func WriteCue(shippedCue []byte, destCue string, binNames ...string) error {
+	if len(binNames) == 0 {
+		return errors.New("cue: no track file to point at")
+	}
 	lines := strings.Split(strings.ReplaceAll(string(shippedCue), "\r\n", "\n"), "\n")
+	n := 0
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(strings.ToUpper(trimmed), "FILE ") {
@@ -169,9 +177,27 @@ func WriteCue(shippedCue []byte, destCue, binName string) error {
 		if fields := strings.Fields(trimmed); len(fields) > 0 {
 			mode = fields[len(fields)-1]
 		}
-		lines[i] = fmt.Sprintf("%sFILE \"%s\" %s", indent, binName, mode)
+		name := binNames[len(binNames)-1]
+		if n < len(binNames) {
+			name = binNames[n]
+		}
+		n++
+		lines[i] = fmt.Sprintf("%sFILE \"%s\" %s", indent, name, mode)
 	}
 	return os.WriteFile(destCue, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+// CueFileCount reports how many FILE lines a cue sheet has: one per track
+// file. Used to tell whether a shipped cue describes the same layout as
+// the disc on the card.
+func CueFileCount(cue []byte) int {
+	n := 0
+	for _, line := range strings.Split(strings.ReplaceAll(string(cue), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FILE ") {
+			n++
+		}
+	}
+	return n
 }
 
 // DefaultCue builds a single-track cue for a data-only image, used when a

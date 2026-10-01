@@ -43,6 +43,42 @@ func TestWriteCueRepointsFile(t *testing.T) {
 	}
 }
 
+// A disc with CD audio keeps one file per track. Each FILE line must point
+// at its own track: sending them all to the data track verified fine (the
+// RetroAchievements hash only reads track 1) and then played with no music.
+func TestWriteCueKeepsOneFilePerTrack(t *testing.T) {
+	shipped := "FILE \"Hack (Track 1).bin\" BINARY\n" +
+		"  TRACK 01 MODE2/2352\n" +
+		"    INDEX 01 00:00:00\n" +
+		"FILE \"Hack (Track 2).bin\" BINARY\n" +
+		"  TRACK 02 AUDIO\n" +
+		"    INDEX 01 00:00:00\n"
+	if n := CueFileCount([]byte(shipped)); n != 2 {
+		t.Fatalf("CueFileCount = %d, want 2", n)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out.cue")
+	if err := WriteCue([]byte(shipped), dest, "My Hack.bin", "My Hack (Track 02).bin"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(dest)
+	text := string(got)
+	first := strings.Index(text, "FILE \"My Hack.bin\" BINARY")
+	second := strings.Index(text, "FILE \"My Hack (Track 02).bin\" BINARY")
+	if first < 0 || second < 0 || second < first {
+		t.Errorf("each FILE line should name its own track, in order:\n%s", text)
+	}
+	if strings.Count(text, "My Hack.bin") != 1 {
+		t.Errorf("the data track is named more than once:\n%s", text)
+	}
+}
+
+func TestWriteCueNeedsAName(t *testing.T) {
+	if err := WriteCue([]byte("FILE \"a.bin\" BINARY\n"), filepath.Join(t.TempDir(), "x.cue")); err == nil {
+		t.Error("WriteCue with no track name should fail")
+	}
+}
+
 func TestIsCompressed(t *testing.T) {
 	for path, want := range map[string]bool{
 		"game.chd": true, "GAME.CHD": true,

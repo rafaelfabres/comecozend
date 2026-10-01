@@ -1458,12 +1458,21 @@ func (a *ui) deleteInstalled() {
 		a.manage.SetError("This hack is not installed any more")
 		return
 	}
+	// A disc is a cue plus one file per track; every track the cue names
+	// beside it goes too. Read before the cue itself is removed.
+	var tracks []string
+	if strings.EqualFold(filepath.Ext(path), ".cue") {
+		tracks, _ = rahub.CueFiles(path)
+		tracks = append(tracks, strings.TrimSuffix(path, filepath.Ext(path))+".bin")
+	}
 	if err := os.Remove(path); err != nil {
 		a.manage.SetError(err.Error())
 		return
 	}
-	if strings.EqualFold(filepath.Ext(path), ".cue") {
-		os.Remove(strings.TrimSuffix(path, filepath.Ext(path)) + ".bin")
+	for _, t := range tracks {
+		if filepath.Dir(t) == filepath.Dir(path) {
+			os.Remove(t)
+		}
 	}
 	removeArtwork(path)
 	// The menu would otherwise keep listing a game whose file is gone.

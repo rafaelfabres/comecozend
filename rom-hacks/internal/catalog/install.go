@@ -672,7 +672,13 @@ func installDisc(p *Plan, romsRoot string, report Reporter) (string, error) {
 		return "", err
 	}
 
-	var sourceBin string
+	// tracks is every file of the disc, data track first; layoutCue is the
+	// cue that describes them, when there is one. Only the data track is
+	// patched, but a disc with CD audio needs the other tracks beside it,
+	// or the hack plays without its music.
+	var tracks []string
+	var layoutCue string
+	extractedTracks := false
 	if disc.IsCompressed(basePath) {
 		report.stage(StageExtract)
 		extracted, err := disc.Extract(basePath, dir, stem+" (original)")
@@ -680,20 +686,35 @@ func installDisc(p *Plan, romsRoot string, report Reporter) (string, error) {
 			return "", err
 		}
 		defer extracted.Cleanup()
-		sourceBin = extracted.Bin
-	} else {
-		sourceBin = basePath
-		if strings.EqualFold(filepath.Ext(sourceBin), ".cue") {
-			files, err := rahub.CueFiles(sourceBin)
-			if err != nil || len(files) == 0 {
-				return "", fmt.Errorf("could not read the track list from %s", filepath.Base(sourceBin))
-			}
-			sourceBin = files[0]
+		tracks = extracted.Tracks
+		if len(tracks) == 0 {
+			tracks = []string{extracted.Bin}
 		}
+		layoutCue = extracted.Cue
+		extractedTracks = true
+	} else if strings.EqualFold(filepath.Ext(basePath), ".cue") {
+		files, err := rahub.CueFiles(basePath)
+		if err != nil || len(files) == 0 {
+			return "", fmt.Errorf("could not read the track list from %s", filepath.Base(basePath))
+		}
+		tracks = files
+		layoutCue = basePath
+	} else {
+		tracks = []string{basePath}
 	}
+	sourceBin := tracks[0]
 
 	binPath := filepath.Join(dir, stem+".bin")
 	cuePath := filepath.Join(dir, stem+".cue")
+
+	// Everything written into the hacks folder, so a failure at any later
+	// step leaves nothing behind.
+	written := []string{binPath}
+	discard := func() {
+		for _, f := range written {
+			os.Remove(f)
+		}
+	}
 
 	// Streamed, never loaded. A PlayStation track is around 600 MB, and
 	// holding the source and the target at once on a 1 GB handheld got
@@ -730,31 +751,105 @@ func installDisc(p *Plan, romsRoot string, report Reporter) (string, error) {
 		return "", patchErr
 	}
 
-	// The cue that shipped with the patch, repointed at the file just
+	// The other tracks go beside the patched one. Extracted tracks are this
+	// install's own temporary files, so they are moved; tracks from a
+	// .bin/.cue set on the card are the user's, so they are copied.
+	names := []string{filepath.Base(binPath)}
+	for i, t := range tracks[1:] {
+		dest := filepath.Join(dir, fmt.Sprintf("%s (Track %02d)%s", stem, i+2, filepath.Ext(t)))
+		var err error
+		if extractedTracks {
+			err = os.Rename(t, dest)
+		} else {
+			err = copyFile(t, dest)
+		}
+		if err != nil {
+			discard()
+			return "", fmt.Errorf("could not keep track %d of the disc: %w", i+2, err)
+		}
+		written = append(written, dest)
+		names = append(names, filepath.Base(dest))
+	}
+
+	// The cue that shipped with the patch, repointed at the files just
 	// written; a cue naming a file that is not there loads as a blank disc.
-	cueData := disc.DefaultCue(filepath.Base(binPath))
+	// It is only trusted when it describes as many track files as the
+	// disc has; otherwise the disc's own cue gives the layout.
+	cueData := disc.DefaultCue(names[0])
+	if layoutCue != "" {
+		if b, err := os.ReadFile(layoutCue); err == nil && disc.CueFileCount(b) == len(names) {
+			cueData = b
+		}
+	}
 	for _, f := range p.Extras {
 		if strings.EqualFold(filepath.Ext(f.Name), ".cue") {
-			cueData = f.Bytes()
+			if b := f.Bytes(); disc.CueFileCount(b) == len(names) {
+				cueData = b
+			}
 			break
 		}
 	}
-	if err := disc.WriteCue(cueData, cuePath, filepath.Base(binPath)); err != nil {
-		os.Remove(binPath)
+	written = append(written, cuePath)
+	if err := disc.WriteCue(cueData, cuePath, names...); err != nil {
+		discard()
 		return "", err
 	}
 
 	// Only now can the result be checked: the RetroAchievements hash for a
 	// PlayStation game is taken from the boot executable inside the image.
+	// A disc that cannot be hashed is not kept either: unverified is
+	// exactly what this app promises never to install.
 	report.stage(StageVerify)
 	console, _ := p.Hack.Console()
-	got, err := rahub.HashImage(console, cuePath)
-	if err == nil {
-		if _, ok := p.matchSupported(got); !ok {
-			os.Remove(binPath)
-			os.Remove(cuePath)
-			return "", fmt.Errorf("the patched disc does not match RetroAchievements (%s, it accepts %s) — achievements would not work, so it was not kept", got[:8], shortHashes(p.Supported))
-		}
+	got, err := hashImage(console, cuePath)
+	if err != nil {
+		discard()
+		return "", fmt.Errorf("the patched disc could not be checked against RetroAchievements (%v), so it was not kept", err)
+	}
+	if _, ok := p.matchSupported(got); !ok {
+		discard()
+		return "", fmt.Errorf("the patched disc does not match RetroAchievements (%s, it accepts %s) — achievements would not work, so it was not kept", shortHash(got), shortHashes(p.Supported))
 	}
 	return cuePath, nil
+}
+
+// hashImage is rahub.HashImage, swappable in tests: building a bootable
+// PlayStation image just to exercise the file handling around it is not
+// worth it.
+var hashImage = rahub.HashImage
+
+func shortHash(h string) string {
+	if len(h) > 8 {
+		return h[:8]
+	}
+	return h
+}
+
+// copyFile copies src to dst through a temporary name, so a half-written
+// track never sits in the hacks folder under its real name.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
