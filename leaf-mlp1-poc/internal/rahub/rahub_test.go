@@ -1148,3 +1148,45 @@ func TestUserProgress(t *testing.T) {
 		t.Errorf("stored %d %+v", n, store.State(10).Progress)
 	}
 }
+
+// A file that matches RetroAchievements but cannot be copied into the ROM
+// folder (card full, read-only) is still the right file. It used to be
+// marked as tried, so every later attempt answered "all files already
+// checked" and never downloaded it again.
+func TestPipelineInstallFailureDoesNotBlacklistTheFile(t *testing.T) {
+	dir := t.TempDir()
+	rom := []byte("the RA dump of alien force")
+	itch := &fakeItch{
+		results: []Candidate{{URL: "https://d.itch.io/alien-force", Title: "Alien Force", Text: "Atari 2600"}},
+		pages:   map[string][]Upload{"https://d.itch.io/alien-force": {{Name: "alienforce.a26", ID: "1"}}},
+		files:   map[string][]byte{"1": rom},
+	}
+	store, _ := OpenStore(dir, 3036)
+	game := HubGame{ID: 26007, Title: "~Homebrew~ Alien Force", ConsoleID: 25, ConsoleName: "Atari 2600",
+		Hashes: []string{md5hex(rom)}, HashesKnown: true}
+	store.SetGames([]HubGame{game})
+
+	// The ROM folder's path is taken by a file, so it cannot be created.
+	lib := filepath.Join(dir, "lib")
+	os.WriteFile(lib, []byte("in the way"), 0o644)
+	p := NewPipeline(store, nil, itch, filepath.Join(dir, "work"), func(Console) (Destination, error) { return Destination{Dir: lib}, nil })
+	p.SearchDelay = 0
+
+	_, err := p.Install(context.Background(), game, false, nil)
+	if !errors.Is(err, ErrInstallFailed) {
+		t.Fatalf("want ErrInstallFailed, got %v", err)
+	}
+	if tried := store.State(26007).TriedUploads; len(tried) != 0 {
+		t.Errorf("a verified file was marked as tried: %v", tried)
+	}
+
+	// Once the card is fixed, the same file installs without force.
+	os.Remove(lib)
+	res, err := p.Install(context.Background(), game, false, nil)
+	if err != nil {
+		t.Fatalf("second attempt: %v", err)
+	}
+	if got, _ := os.ReadFile(res.Path); string(got) != string(rom) {
+		t.Error("installed the wrong bytes")
+	}
+}

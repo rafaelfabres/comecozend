@@ -120,6 +120,9 @@ var (
 	ErrDemoGone = errors.New("RetroAchievements has the demo, but itch.io now only offers the full (paid) game")
 	// ErrVersionGone: RA's hashes are for a version itch.io no longer offers.
 	ErrVersionGone = errors.New("the version RetroAchievements supports is no longer offered")
+	// ErrInstallFailed: a file matched RetroAchievements but could not be
+	// copied into the ROM folder. The download was right; the card was not.
+	ErrInstallFailed = errors.New("install")
 )
 
 // Resolve is the QUICK lookup, used when a game is opened or browsed: one
@@ -781,6 +784,15 @@ func (p *Pipeline) Install(ctx context.Context, g HubGame, force bool, progress 
 				}
 				say("Checking the hash...")
 				res, ok, err := p.verify(g, console, dl, up, job, dest, seenVersions)
+				if err != nil && !ok && errors.Is(err, ErrInstallFailed) {
+					// The file verified; only copying it into the ROM
+					// folder failed (card full, read-only, ...). It is the
+					// right file, so it must not be marked as tried —
+					// that hid it behind "all files already checked" on
+					// every later attempt. Stop and say why.
+					say("  %v", err)
+					return Result{}, false, err
+				}
 				if err != nil && !ok {
 					lastErr = err
 					say("  %v", err)
@@ -934,7 +946,10 @@ func (p *Pipeline) verify(g HubGame, c Console, download string, up Upload, job 
 				name += ".zip"
 			}
 			dest, err := placeFile(download, destDir, name)
-			return Result{Path: dest, MD5: h}, err == nil, err
+			if err != nil {
+				return Result{}, false, fmt.Errorf("%w: %w", ErrInstallFailed, err)
+			}
+			return Result{Path: dest, MD5: h}, true, nil
 		}
 		return Result{}, false, nil
 	}
@@ -968,7 +983,7 @@ func (p *Pipeline) verify(g HubGame, c Console, download string, up Upload, job 
 		name := InstallName(g, c, f, dest.Exts)
 		dest, err := placeVerified(c, f, destDir, name, h)
 		if err != nil {
-			return Result{}, false, fmt.Errorf("install: %w", err)
+			return Result{}, false, fmt.Errorf("%w: %w", ErrInstallFailed, err)
 		}
 		return Result{Path: dest, MD5: h}, true, nil
 	}
@@ -1294,7 +1309,7 @@ func (p *Pipeline) verifyDisc(g HubGame, c Console, files []string, dest Destina
 			path, err = placeVerified(c, f, dest.Dir, InstallName(g, c, f, dest.Exts), h)
 		}
 		if err != nil {
-			return Result{}, false, fmt.Errorf("install: %w", err)
+			return Result{}, false, fmt.Errorf("%w: %w", ErrInstallFailed, err)
 		}
 		return Result{Path: path, MD5: h}, true, nil
 	}
