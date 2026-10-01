@@ -486,7 +486,7 @@ func extractBundle(zipPath, destDir string) (string, error) {
 func downloadAndExtractBundle(ctx context.Context, client *itchio.Client,
 	upload roms.Upload, destDir string) (string, error) {
 
-	tmp, err := os.CreateTemp("", "itchio-bundle-*.zip")
+	tmp, err := roms.CreateTemp("itchio-bundle-*.zip")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
 	}

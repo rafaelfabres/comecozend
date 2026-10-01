@@ -198,7 +198,7 @@ func inspectViaRange(client *http.Client, cdnURL string, size int64, onProgress 
 }
 
 func inspectViaFullDownload(client *http.Client, cdnURL string) (ZIPManifest, error) {
-	tmp, err := os.CreateTemp("", "itchio-inspect-*.zip")
+	tmp, err := CreateTemp("itchio-inspect-*.zip")
 	if err != nil {
 		return ZIPManifest{}, fmt.Errorf("create temp: %w", err)
 	}

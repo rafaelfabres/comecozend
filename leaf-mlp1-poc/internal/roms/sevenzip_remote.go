@@ -17,7 +17,7 @@ import (
 // Unlike ZIP, 7z cannot be inspected via HTTP Range requests, so a full
 // download is always required.
 func InspectRemote7z(client *http.Client, cdnURL string) (ZIPManifest, error) {
-	tmp, err := os.CreateTemp("", "itchio-inspect-*.7z")
+	tmp, err := CreateTemp("itchio-inspect-*.7z")
 	if err != nil {
 		return ZIPManifest{}, fmt.Errorf("create temp: %w", err)
 	}

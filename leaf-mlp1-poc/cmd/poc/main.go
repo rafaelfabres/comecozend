@@ -886,6 +886,14 @@ func main() {
 
 	migrateLegacyData()
 
+	// Downloads are staged on the card, not in /tmp: on dArkOS /tmp is a
+	// tmpfs, i.e. RAM, and a disc-sized archive staged there can use up
+	// the whole gigabyte. Whatever an interrupted run left there goes now.
+	roms.TempDir = filepath.Join(dataDir(), "tmp")
+	if n := roms.SweepTemp(); n > 0 {
+		fmt.Fprintf(os.Stderr, "removed %d leftover download(s) from %s\n", n, roms.TempDir)
+	}
+
 	cfg := loadConfig()
 	noROM := loadNoROM()
 	// --login / --logout / --whoami run without opening the UI at all.
@@ -1380,7 +1388,7 @@ func main() {
 				}
 				if archive != nil {
 					downloadDone <- downloadResult{game.Title, "Downloading archive..."}
-					tmp, err := os.CreateTemp("", "itchio-archive-*")
+					tmp, err := roms.CreateTemp("itchio-archive-*")
 					if err != nil {
 						downloadDone <- downloadResult{game.Title, "Could not create temp file: " + err.Error()}
 						return
