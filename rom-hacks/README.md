@@ -1,5 +1,24 @@
 # ROM Hacks — v1
 
+## v35 — correções de bugs
+
+- PS1 com faixas de áudio: cada faixa vai para `hacks/` e o `.cue` aponta
+  cada `FILE` para a sua (antes todas apontavam para a faixa de dados e o
+  jogo ficava sem música). "Delete this hack" apaga as faixas também.
+- Disco cujo hash não pode ser calculado não fica mais instalado sem
+  verificação.
+- Trocar de página com L/R durante o preparo não faz mais o A instalar o
+  hack da página anterior, e o arquivo baixado da página anterior é
+  liberado.
+- Patch corrompido dá erro em vez de fechar o app.
+- Patches grandes (PS1, ~80 MB) baixam em Wi-Fi lento: o limite de 2 min
+  por download virou "60 s sem receber nada". Download maior que o limite
+  é recusado em vez de truncado.
+- "Delete this hack" só apaga arquivos que o próprio app instalou; hacks
+  que você já tinha em `hacks/` ficam intactos.
+- Mensagem de erro útil ("this patch needs ...") quando só há uma cópia
+  do jogo base.
+
 Lista os ROM hacks do RetroAchievements que dá para montar com as ROMs que
 já estão neste aparelho, baixa o patch do repositório do próprio RA, aplica
 localmente e instala o resultado em `/roms`.

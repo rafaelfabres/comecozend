@@ -1,3 +1,20 @@
+# v97 — correções de bugs
+
+- Jogos de disco em .zip (PS1): cada faixa .bin era cortada em 64 MB e o
+  jogo instalava corrompido. Agora aceita até 1 GB por arquivo e, se
+  passar disso, dá erro em vez de gravar o arquivo pela metade.
+- Zip sem pasta raiz: `lib/util.lua` não vira mais `util.lua` (os
+  `#include` do PICO-8 voltam a funcionar). Zips feitos no Windows (com
+  `\`) são extraídos em pastas.
+- Arquivo que bateu com o hash do RA mas não pôde ser copiado (cartão
+  cheio, sem permissão) não fica mais marcado como "já tentado": o erro
+  real aparece e a próxima tentativa baixa de novo.
+- Downloads temporários ficam em `~/.local/share/leaf-itchio/tmp`, no
+  cartão, e não mais em `/tmp` (que é RAM no dArkOS). Sobras são apagadas
+  ao abrir o app.
+- Download que para de receber dados por 60 s é abandonado com erro, em
+  vez de ficar em "Downloading..." para sempre.
+
 # v92 — "novos" = Last Updated do RetroAchievements
 
 - Order > "Recently updated on RA": ordena pela data em que o conjunto de
