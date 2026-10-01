@@ -1,5 +1,18 @@
 # ROM Hacks — v1
 
+## v36 — correções de bugs
+
+- Refresh, verificação periódica, rescan e instalação não disputam mais a
+  lista: rodam um de cada vez, e a verificação periódica é pulada se um
+  Refresh já estiver rodando. O botão de Refresh não é mais liberado no
+  meio de outro.
+- Aplicar patches de disco com preenchimentos longos ficou muito mais
+  rápido (antes: um acesso ao cartão por byte).
+- xdelta3 trabalha na pasta temporária do cartão, não em `/tmp` (RAM).
+- A instalação faz um rescan só, em vez de dois.
+- A lista é reconstruída quando o índice de patches muda, mesmo que o
+  número de hacks continue igual.
+
 ## v35 — correções de bugs
 
 - PS1 com faixas de áudio: cada faixa vai para `hacks/` e o `.cue` aponta

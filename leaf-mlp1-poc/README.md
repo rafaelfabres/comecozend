@@ -1,3 +1,14 @@
+# v98 — correções de bugs
+
+- Mover jogos para a pasta `itchio/` não apaga mais o jogo quando já
+  existe outro arquivo com o mesmo nome: só descarta se for idêntico, senão
+  usa um nome livre ("Game (2).gb").
+- NES: a troca automática Nestopia → FCEUmm (para as conquistas
+  funcionarem) agora também vale quando no EmulationStation foi escolhido
+  só o emulador, sem core.
+- Ao abrir um sistema direto no RetroArch, o comando usado é o do mesmo
+  RetroArch (`retroarch` ou `retroarch32`), com a pasta de cores certa.
+
 # v97 — correções de bugs
 
 - Jogos de disco em .zip (PS1): cada faixa .bin era cortada em 64 MB e o
