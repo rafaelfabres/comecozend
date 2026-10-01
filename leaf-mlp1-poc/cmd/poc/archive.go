@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,26 @@ import (
 // maxExtractedROM caps what we will write out of an archive, so a malicious
 // or malformed zip cannot fill the SD card.
 const maxExtractedROM = 64 << 20 // 64 MiB
+
+// maxExtractedTrack is the cap for one file of a multi-file release. A
+// PlayStation data track alone is around 600 MB, so the cartridge cap above
+// cut every disc bundle short.
+var maxExtractedTrack int64 = 1 << 30 // 1 GiB; a var so tests can lower it
+
+// errTooLarge means an archive entry is bigger than the cap. Writing the
+// first N bytes and calling it done installed a truncated ROM that looked
+// fine in the menu and failed in the emulator.
+var errTooLarge = errors.New("file inside the archive is larger than this app will extract")
+
+// copyCapped copies at most max bytes and fails, rather than truncating,
+// when src holds more.
+func copyCapped(dst io.Writer, src io.Reader, max int64) (int64, error) {
+	n, err := io.Copy(dst, io.LimitReader(src, max+1))
+	if err == nil && n > max {
+		return n, fmt.Errorf("%w (%d MB)", errTooLarge, max>>20)
+	}
+	return n, err
+}
 
 // extractROMFromZip opens a downloaded .zip, finds the best ROM inside it and
 // writes that ROM to its system folder. Many homebrew releases ship the ROM
@@ -93,7 +114,7 @@ func extractROMFromZip(zipPath, titleForName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create %s: %w", destPath, err)
 	}
-	written, err := io.Copy(out, io.LimitReader(source, maxExtractedROM))
+	written, err := copyCapped(out, source, maxExtractedROM)
 	closeErr := out.Close()
 	if err != nil {
 		os.Remove(destPath)
@@ -178,7 +199,7 @@ func extractROMFrom7z(archivePath, titleForName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, err = io.Copy(out, io.LimitReader(source, maxExtractedROM))
+	_, err = copyCapped(out, source, maxExtractedROM)
 	closeErr := out.Close()
 	if err != nil || closeErr != nil {
 		os.Remove(destPath)
@@ -417,27 +438,32 @@ func extractBundle(zipPath, destDir string) (string, error) {
 	}
 	defer reader.Close()
 
-	mainFile, indexFile := "", ""
-	written := 0
+	var files []*zip.File
 	for _, file := range reader.File {
 		if file.FileInfo().IsDir() || strings.HasPrefix(file.Name, "__MACOSX/") {
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(file.Name))
-		if !bundleExtensions[ext] {
-			continue
+		if bundleExtensions[strings.ToLower(filepath.Ext(file.Name))] {
+			files = append(files, file)
 		}
+	}
+	wrapper := bundleWrapper(files)
 
-		// Flatten one leading directory: archives usually wrap everything in
-		// a folder, and #include paths are relative to the cart itself.
-		rel := file.Name
-		if idx := strings.Index(rel, "/"); idx >= 0 {
-			rel = rel[idx+1:]
-		}
-		if rel == "" || strings.Contains(rel, "..") {
+	mainFile, indexFile := "", ""
+	written := 0
+	for _, file := range files {
+		ext := strings.ToLower(filepath.Ext(file.Name))
+
+		// Drop the folder the archive wraps everything in, when it does:
+		// #include paths are relative to the cart itself. Only a folder
+		// shared by every file is dropped — stripping each file's first
+		// directory turned "lib/util.lua" beside a top-level cart into
+		// "util.lua", and the cart's #include "lib/util.lua" then failed.
+		rel := strings.TrimPrefix(archiveName(file), wrapper)
+		if !safeRelPath(rel) {
 			continue
 		}
-		outPath := filepath.Join(destDir, rel)
+		outPath := filepath.Join(destDir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 			continue
 		}
@@ -451,9 +477,14 @@ func extractBundle(zipPath, destDir string) (string, error) {
 			source.Close()
 			continue
 		}
-		_, copyErr := io.Copy(out, io.LimitReader(source, maxExtractedROM))
+		_, copyErr := copyCapped(out, source, maxExtractedTrack)
 		out.Close()
 		source.Close()
+		if errors.Is(copyErr, errTooLarge) {
+			// A disc missing a track is no install at all.
+			os.Remove(outPath)
+			return "", fmt.Errorf("%s: %w", rel, copyErr)
+		}
 		if copyErr != nil {
 			os.Remove(outPath)
 			continue
@@ -479,6 +510,47 @@ func extractBundle(zipPath, destDir string) (string, error) {
 		return "", fmt.Errorf("archive has no playable file at its top level")
 	}
 	return mainFile, nil
+}
+
+// bundleWrapper returns the "folder/" every file of a release sits in, or
+// "" when they do not all share one.
+func bundleWrapper(files []*zip.File) string {
+	wrapper := ""
+	for i, f := range files {
+		name := archiveName(f)
+		idx := strings.Index(name, "/")
+		if idx < 0 {
+			return "" // a file at the top level: nothing wraps the release
+		}
+		first := name[:idx+1]
+		if i == 0 {
+			wrapper = first
+		} else if first != wrapper {
+			return ""
+		}
+	}
+	return wrapper
+}
+
+// archiveName is an entry's path with "/" separators. Zips made on
+// Windows sometimes store "Game\\Track 01.bin".
+func archiveName(f *zip.File) string {
+	return strings.ReplaceAll(f.Name, "\\", "/")
+}
+
+// safeRelPath reports whether a path from an archive stays inside the
+// folder it is extracted to. ".." is refused as a path element only, so a
+// file legitimately named "Game..v2.bin" still extracts.
+func safeRelPath(rel string) bool {
+	if rel == "" || strings.HasPrefix(rel, "/") {
+		return false
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // downloadAndExtractBundle fetches an archive upload and unpacks the complete
