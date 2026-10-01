@@ -88,6 +88,22 @@ func Apply(patchData, source []byte) ([]byte, error) {
 
 const bpsFooterLen = 12
 
+// maxTarget caps the size a patch may declare for its output. The largest
+// cartridge is 64 MB and the in-memory path only handles cartridges; a
+// corrupt or hostile header asking for terabytes used to reach make() and
+// end the app with an out-of-memory fatal error, which no recover catches.
+const maxTarget = 512 << 20
+
+// checkedSize turns a size read from a patch header into an int, refusing
+// anything past limit. Converting first and checking after let a huge
+// value wrap negative and slip through.
+func checkedSize(v uint64, limit int, what string) (int, error) {
+	if v > uint64(limit) {
+		return 0, fmt.Errorf("%s: %d is out of range", what, v)
+	}
+	return int(v), nil
+}
+
 type bpsReader struct {
 	data []byte
 	pos  int
@@ -157,12 +173,17 @@ func applyBPS(patchData, source []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r.pos+int(metaSize) > len(body) {
-		return nil, errors.New("bps: metadata overruns file")
+	meta, err := checkedSize(metaSize, len(body)-r.pos, "bps: metadata size")
+	if err != nil {
+		return nil, err
 	}
-	r.pos += int(metaSize)
+	r.pos += meta
+	size, err := checkedSize(dstSize, maxTarget, "bps: target size")
+	if err != nil {
+		return nil, err
+	}
 
-	target := make([]byte, dstSize)
+	target := make([]byte, size)
 	var outPos int
 	var srcRel, dstRel int64
 
@@ -172,10 +193,10 @@ func applyBPS(patchData, source []byte) ([]byte, error) {
 			return nil, err
 		}
 		action := cmd & 3
-		length := int(cmd>>2) + 1
-		if outPos+length > len(target) {
+		if cmd>>2 >= uint64(len(target)-outPos) {
 			return nil, errors.New("bps: action runs past the end of the target")
 		}
+		length := int(cmd>>2) + 1
 
 		switch action {
 		case 0: // SourceRead: same offset in the base ROM
@@ -199,7 +220,7 @@ func applyBPS(patchData, source []byte) ([]byte, error) {
 				return nil, err
 			}
 			srcRel += off
-			if srcRel < 0 || srcRel+int64(length) > int64(len(source)) {
+			if srcRel < 0 || srcRel > int64(len(source))-int64(length) {
 				return nil, errors.New("bps: source copy out of range")
 			}
 			copy(target[outPos:outPos+length], source[srcRel:srcRel+int64(length)])
@@ -212,7 +233,10 @@ func applyBPS(patchData, source []byte) ([]byte, error) {
 				return nil, err
 			}
 			dstRel += off
-			if dstRel < 0 || dstRel >= int64(len(target)) {
+			// Only bytes already written may be read back. A patch that
+			// points at or past the write head would index off the end of
+			// the target partway through the run.
+			if dstRel < 0 || dstRel >= int64(outPos) {
 				return nil, errors.New("bps: target copy out of range")
 			}
 			// Byte at a time on purpose: the ranges may overlap, and
@@ -318,7 +342,11 @@ func applyUPS(patchData, source []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, dstSize)
+	size, err := checkedSize(dstSize, maxTarget, "ups: target size")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, size)
 	copy(out, source)
 
 	var pos uint64

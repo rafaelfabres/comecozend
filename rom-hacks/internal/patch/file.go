@@ -19,6 +19,11 @@ import (
 // through file handles. Peak memory is a few hundred kilobytes regardless
 // of disc size.
 
+// maxDiscTarget caps what a streamed patch may write. A CD image is under
+// 900 MB and a PSP ISO under 2 GB; a corrupt header asking for more would
+// otherwise fill the card before the size check at the end caught it.
+const maxDiscTarget = 4 << 30
+
 // copyBufSize is the working buffer for streaming copies.
 const copyBufSize = 1 << 20
 
@@ -88,14 +93,18 @@ func applyBPSFile(patchData []byte, srcPath, dstPath string, progress Progress) 
 	if err != nil {
 		return err
 	}
+	if dstSize > maxDiscTarget {
+		return fmt.Errorf("bps: target size %d is out of range", dstSize)
+	}
 	metaSize, err := r.number()
 	if err != nil {
 		return err
 	}
-	if r.pos+int(metaSize) > len(body) {
-		return errors.New("bps: metadata overruns file")
+	meta, err := checkedSize(metaSize, len(body)-r.pos, "bps: metadata size")
+	if err != nil {
+		return err
 	}
-	r.pos += int(metaSize)
+	r.pos += meta
 
 	dst, err := os.Create(dstPath)
 	if err != nil {
@@ -158,10 +167,10 @@ func applyBPSFile(patchData []byte, srcPath, dstPath string, progress Progress) 
 			return err
 		}
 		action := cmd & 3
-		length := int(cmd>>2) + 1
-		if outPos+int64(length) > int64(dstSize) {
+		if outPos >= int64(dstSize) || cmd>>2 >= dstSize-uint64(outPos) {
 			return errors.New("bps: action runs past the end of the target")
 		}
+		length := int(cmd>>2) + 1
 
 		switch action {
 		case 0: // SourceRead
@@ -184,7 +193,7 @@ func applyBPSFile(patchData []byte, srcPath, dstPath string, progress Progress) 
 				return err
 			}
 			srcRel += off
-			if srcRel < 0 || srcRel+int64(length) > info.Size() {
+			if srcRel < 0 || srcRel > info.Size()-int64(length) {
 				return errors.New("bps: source copy out of range")
 			}
 			if err := copyFrom(src, srcRel, length); err != nil {
