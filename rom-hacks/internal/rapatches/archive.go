@@ -12,6 +12,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/bodgit/sevenzip"
 )
@@ -148,9 +150,30 @@ func DownloadTo(ctx context.Context, client *http.Client, e Entry, dir string) (
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := get(ctx, client, e)
+	// The shared client's Timeout covers the whole body, and two minutes
+	// is not enough for an 80 MB PlayStation patch on handheld Wi-Fi: the
+	// download failed every time on a slow connection. Here the only limit
+	// is a stall — StallTimeout without a byte cancels it.
+	dl := *client
+	dl.Timeout = 0
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stalled atomic.Bool
+	watchdog := time.AfterFunc(StallTimeout, func() {
+		stalled.Store(true)
+		cancel()
+	})
+	defer watchdog.Stop()
+	stallErr := func(err error) error {
+		if stalled.Load() {
+			return fmt.Errorf("download %s: %w: no data for %s", e.File, ErrStalled, StallTimeout)
+		}
+		return err
+	}
+
+	resp, err := get(ctx, &dl, e)
 	if err != nil {
-		return "", err
+		return "", stallErr(err)
 	}
 	defer resp.Body.Close()
 
@@ -164,20 +187,41 @@ func DownloadTo(ctx context.Context, client *http.Client, e Entry, dir string) (
 	// One byte past the cap tells "exactly at the limit" from "cut off".
 	// Stopping at the cap and calling it done kept the first gigabyte of a
 	// bigger archive, which then failed as "not a valid zip".
-	n, err := io.Copy(f, io.LimitReader(resp.Body, maxArchive+1))
+	n, err := io.Copy(f, io.LimitReader(&progressReader{r: resp.Body, onRead: func() { watchdog.Reset(StallTimeout) }}, maxArchive+1))
 	if err == nil && n > maxArchive {
 		err = ErrTooLarge
 	}
 	if err != nil {
 		f.Close()
 		os.Remove(f.Name())
-		return "", fmt.Errorf("download %s: %w", e.File, err)
+		return "", stallErr(fmt.Errorf("download %s: %w", e.File, err))
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(f.Name())
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// StallTimeout is how long a download may receive nothing before it is
+// abandoned. A var so tests can shorten it.
+var StallTimeout = 60 * time.Second
+
+// ErrStalled means the connection stopped delivering data.
+var ErrStalled = errors.New("download stalled")
+
+// progressReader calls onRead whenever bytes arrive.
+type progressReader struct {
+	r      io.Reader
+	onRead func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.onRead()
+	}
+	return n, err
 }
 
 func get(ctx context.Context, client *http.Client, e Entry) (*http.Response, error) {

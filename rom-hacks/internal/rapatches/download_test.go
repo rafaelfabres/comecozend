@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // An archive past the cap is refused, not cut to the cap and handed on:
@@ -55,5 +56,57 @@ func TestLoadReportsTheReadError(t *testing.T) {
 	}
 	if p.Bytes() != nil {
 		t.Error("Bytes should still return nil on a read error")
+	}
+}
+
+// The shared client's whole-request timeout must not apply to an archive
+// download: a slow but moving transfer has to finish.
+func TestDownloadToOutlastsTheClientTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < 5; i++ {
+			w.Write([]byte("x"))
+			w.(http.Flusher).Flush()
+			time.Sleep(60 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	defer SetRawBaseForTest(srv.URL + "/")()
+
+	client := srv.Client()
+	client.Timeout = 100 * time.Millisecond // shorter than the transfer
+	path, err := DownloadTo(context.Background(), client, Entry{Path: "a/b.zip", File: "b.zip"}, t.TempDir())
+	if err != nil {
+		t.Fatalf("a slow but moving download failed: %v", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "xxxxx" {
+		t.Errorf("got %q", b)
+	}
+}
+
+// A connection that stops sending ends the download with ErrStalled.
+func TestDownloadToGivesUpOnAStall(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("x"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	defer SetRawBaseForTest(srv.URL + "/")()
+	old := StallTimeout
+	StallTimeout = 150 * time.Millisecond
+	defer func() { StallTimeout = old }()
+
+	dir := t.TempDir()
+	_, err := DownloadTo(context.Background(), srv.Client(), Entry{Path: "a/b.zip", File: "b.zip"}, dir)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("want ErrStalled, got %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("a partial download was left behind: %v", entries)
 	}
 }

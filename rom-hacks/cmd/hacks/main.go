@@ -1217,7 +1217,10 @@ func (a *ui) loadStats(parent context.Context, h catalog.Hack) {
 // resolve downloads the patch and decides which local ROM it applies to.
 // It runs off the SDL thread; the outcome arrives as a job.
 func (a *ui) resolve(parent context.Context, h catalog.Hack) {
-	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
+	// Generous on purpose: an 80 MB PlayStation patch on slow Wi-Fi takes
+	// longer than the three minutes this used to allow. A connection that
+	// stops delivering is caught sooner, by the download's own stall check.
+	ctx, cancel := context.WithTimeout(parent, 30*time.Minute)
 	defer cancel()
 
 	plan, err := catalog.Resolve(ctx, httpClient, a.ra, h, a.lib)
