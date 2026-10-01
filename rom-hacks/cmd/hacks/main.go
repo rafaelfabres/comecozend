@@ -35,6 +35,7 @@ import (
 	"leaf-hacks/internal/artwork"
 	"leaf-hacks/internal/catalog"
 	"leaf-hacks/internal/esmeta"
+	"leaf-hacks/internal/library"
 	"leaf-hacks/internal/rahub"
 	"leaf-hacks/internal/sdlui"
 )
@@ -88,6 +89,10 @@ type job struct {
 	// "resolved" job. Workers never assign a.plan themselves: the page may
 	// have changed between the worker's last check and the assignment.
 	plan *catalog.Plan
+	// commit is a background goroutine's change to the shared state, to
+	// be applied on the SDL thread; ack is closed once it has been.
+	commit func()
+	ack    chan struct{}
 }
 
 func main() {
@@ -130,6 +135,13 @@ func main() {
 		list:         listModel,
 		jobs:         make(chan job, 64),
 		descriptions: map[int]catalog.Description{},
+	}
+	// Background work never assigns the shared state itself: it sends the
+	// change here and waits until the SDL thread has applied it.
+	st.deliver = func(f func()) {
+		ack := make(chan struct{})
+		app.jobs <- job{commit: f, ack: ack}
+		<-ack
 	}
 	app.sort = sortByGame
 	app.show = showAll
@@ -751,7 +763,8 @@ func (a *ui) handleSettings(event appui.InputEvent) (exit bool) {
 	case appui.ButtonA:
 		switch rows[a.settingsCursor].Label {
 		case "Include translations":
-			a.cfg.IncludeTranslations = !a.cfg.IncludeTranslations
+			// Through commitHere: a refresh running now reads this flag.
+			a.commitHere(func() { a.cfg.IncludeTranslations = !a.cfg.IncludeTranslations })
 			_ = a.cfg.save()
 			a.setNotice("Translations are included from the next refresh")
 		case "Rescan /roms":
@@ -1046,7 +1059,9 @@ func (a *ui) openDetail() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.pageCancel = cancel
 
-	go a.resolve(ctx, h)
+	// The library as it is now, read here on the SDL thread: the worker
+	// must not read a.lib while a refresh may be replacing it.
+	go a.resolve(ctx, h, a.lib)
 	go a.loadArtwork(ctx, h)
 	go a.loadStats(ctx, h)
 	go a.loadDescription(ctx, h)
@@ -1216,14 +1231,14 @@ func (a *ui) loadStats(parent context.Context, h catalog.Hack) {
 
 // resolve downloads the patch and decides which local ROM it applies to.
 // It runs off the SDL thread; the outcome arrives as a job.
-func (a *ui) resolve(parent context.Context, h catalog.Hack) {
+func (a *ui) resolve(parent context.Context, h catalog.Hack, lib *library.Library) {
 	// Generous on purpose: an 80 MB PlayStation patch on slow Wi-Fi takes
 	// longer than the three minutes this used to allow. A connection that
 	// stops delivering is caught sooner, by the download's own stall check.
 	ctx, cancel := context.WithTimeout(parent, 30*time.Minute)
 	defer cancel()
 
-	plan, err := catalog.Resolve(ctx, httpClient, a.ra, h, a.lib)
+	plan, err := catalog.Resolve(ctx, httpClient, a.ra, h, lib)
 	if err != nil {
 		if parent.Err() != nil {
 			return // the user moved on; this page no longer exists
@@ -1509,7 +1524,7 @@ func (a *ui) deleteInstalled() {
 		_ = esmeta.Remove(filepath.Join(romsRoot, system), path)
 	}
 	_ = a.registry.Remove(a.current.GameID)
-	_ = a.scan(nil)
+	_ = a.scanHere(nil)
 	a.applyCatalog()
 
 	// The page underneath still says the hack is installed, and would
@@ -1718,8 +1733,8 @@ func (a *ui) startInstall() {
 			a.jobs <- job{err: err, done: true, note: "install"}
 			return
 		}
-		a.running.set("Rescanning")
-		_ = a.scan(nil) // so the new ROM shows as installed straight away
+		// installHack has already rescanned, so the new ROM shows as
+		// installed straight away.
 		plan.Close()
 		a.jobs <- job{note: "installed: " + shortPath(dest), done: true}
 	}()
@@ -1752,22 +1767,18 @@ func (a *ui) startPeriodicCheck() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
-
-		// A newer listing is no use on its own: the catalog has to be
-		// rebuilt from it, or hacks that got an achievement set this week
-		// stay invisible until someone runs --refresh by hand. That was
-		// the one thing still needing a manual step.
-		if changed, err := a.refreshIndex(ctx, false); err == nil && changed {
-			a.progress("New hacks in the patch list — rebuilding")
-			if err := a.rebuild(ctx, nil); err == nil {
-				a.jobs <- job{note: "reindexed", done: true}
-			}
-		}
-		if !a.updates.Stale(updateMaxAge) {
+		// Skipped (errBusy) when a refresh is already running: it does the
+		// same work, and the two used to rebuild the list at once.
+		reindexed, checked, err := a.periodicCheck(ctx)
+		if err != nil {
 			return
 		}
-		a.checkUpdates(ctx, false, nil)
-		a.jobs <- job{note: "checked", done: true}
+		if reindexed {
+			a.jobs <- job{note: "reindexed", done: true}
+		}
+		if checked {
+			a.jobs <- job{note: "checked", done: true}
+		}
 	}()
 }
 
@@ -1834,7 +1845,7 @@ func (a *ui) startRescan() {
 	}
 	a.busy = true
 	go func() {
-		err := a.scan(func(done, total int, current string) {
+		err := a.rescan(func(done, total int, current string) {
 			if total > 0 && current != "" {
 				a.progress(fmt.Sprintf("Hashing ROMs %d/%d", done+1, total))
 			}
@@ -1853,6 +1864,11 @@ func (a *ui) progress(msg string) {
 }
 
 func (a *ui) applyJob(j job) {
+	if j.commit != nil {
+		a.commitHere(j.commit)
+		close(j.ack)
+		return
+	}
 	if !j.done {
 		if line, ok := strings.CutPrefix(j.note, "run "); ok {
 			if a.mode == modeDetail {
@@ -1896,7 +1912,12 @@ func (a *ui) applyJob(j job) {
 		a.setNotice(j.note)
 		return
 	}
-	a.busy = false
+	// Only the work that set busy clears it. Clearing it on every finished
+	// job — a page's patch resolving, the periodic check — re-enabled
+	// Refresh while one was still running.
+	if j.note == "refresh" || j.note == "rescan" || j.note == "install" || strings.HasPrefix(j.note, "installed:") {
+		a.busy = false
+	}
 
 	switch j.note {
 	case "resolve":

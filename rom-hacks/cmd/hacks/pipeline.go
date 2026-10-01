@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"leaf-hacks/internal/artwork"
@@ -34,19 +35,54 @@ const updateMaxAge = 48 * time.Hour
 var httpClient = &http.Client{Timeout: 120 * time.Second}
 
 // state is everything the app holds between actions.
+//
+// Concurrency. The app runs background work (refresh, the periodic check,
+// rescans, installs) while the SDL thread draws from these same fields,
+// and two pipelines used to run at once — the periodic check rebuilding
+// the catalog from an index a manual refresh was replacing under it. The
+// rules now:
+//
+//   - The fields marked "replaced by background work" below are only ever
+//     assigned inside a commit. A commit runs on the goroutine that owns
+//     the state — the SDL thread in the app, the only goroutine in the CLI
+//     — holding mu for writing.
+//   - That owner reads the fields freely: nobody else writes them.
+//   - Any other goroutine reads them through snap(), under mu for reading,
+//     and hands its results back with commit(). It never assigns a field.
+//   - The objects behind the fields (Library, Catalog, Index, ...) are not
+//     modified after they are built; replacing is the only change.
+//   - Pipelines take work, so one runs at a time and each starts from what
+//     the previous one committed.
 type state struct {
-	cfg     *Config
-	ra      *rahub.RAClient
+	cfg *Config
+	ra  *rahub.RAClient
+
+	// mu guards the fields replaced by background work; see above.
+	mu sync.RWMutex
+	// work serialises background pipelines. Never taken by the SDL
+	// thread: a pipeline holding it waits for the SDL thread to apply its
+	// commits.
+	work sync.Mutex
+	// deliver, when set, carries a commit to the owning goroutine and
+	// returns once it has run there. Unset (the CLI), commits run inline.
+	deliver func(func())
+
+	// Replaced by background work.
 	lib     *library.Library
 	index   rapatches.Index
 	catalog catalog.Catalog
-
 	// installed is the precomputed lookup behind installedPath.
 	installed map[int]map[string]string
 	// lastScan explains what the most recent scan ignored.
 	lastScan *library.Report
 	// updates is the last look for newer versions of installed hacks.
 	updates catalog.UpdateCheck
+	// bases and sets are kept so the catalog can be rebuilt as
+	// fingerprints arrive, without going back to the network.
+	bases []catalog.OwnedBase
+	sets  map[int]catalog.SetInfo
+
+	// These guard themselves.
 	// stats holds the community numbers behind the popularity sorts.
 	stats *catalog.StatsCache
 	// registry is the record of what this app installed, by game ID.
@@ -54,10 +90,6 @@ type state struct {
 	// facts holds, per patch, the base ROM it says it needs. This is what
 	// makes membership a checksum comparison instead of a name guess.
 	facts *catalog.FactsCache
-	// bases and sets are kept so the catalog can be rebuilt as
-	// fingerprints arrive, without going back to the network.
-	bases []catalog.OwnedBase
-	sets  map[int]catalog.SetInfo
 }
 
 func newState(cfg *Config) *state {
@@ -70,8 +102,55 @@ func newState(cfg *Config) *state {
 	}
 }
 
+// commit applies a background goroutine's results on the owning goroutine.
+func (s *state) commit(f func()) {
+	if s.deliver != nil {
+		s.deliver(f)
+		return
+	}
+	s.commitHere(f)
+}
+
+// commitHere applies a change from the owning goroutine itself. Calling
+// commit there instead would wait on itself forever.
+func (s *state) commitHere(f func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f()
+}
+
+// snapshot is what a background goroutine may read of the state.
+type snapshot struct {
+	lib          *library.Library
+	index        rapatches.Index
+	catalog      catalog.Catalog
+	updates      catalog.UpdateCheck
+	bases        []catalog.OwnedBase
+	sets         map[int]catalog.SetInfo
+	translations bool
+}
+
+func (s *state) snap() snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return snapshot{
+		lib: s.lib, index: s.index, catalog: s.catalog, updates: s.updates,
+		bases: s.bases, sets: s.sets, translations: s.cfg.IncludeTranslations,
+	}
+}
+
+// categories is which parts of the patch repository the catalog draws on.
+func categories(translations bool) []rapatches.Category {
+	cats := []rapatches.Category{rapatches.Hacks}
+	if translations {
+		cats = append(cats, rapatches.Translation)
+	}
+	return cats
+}
+
 // loadCaches brings up whatever the last run left behind, so the list is
-// on screen before any network call happens.
+// on screen before any network call happens. Runs before any background
+// work starts, on the owning goroutine.
 func (s *state) loadCaches() {
 	if lib, err := library.Load(libraryPath()); err == nil {
 		s.lib = lib
@@ -94,67 +173,110 @@ func (s *state) loadCaches() {
 }
 
 // scan fingerprints /roms, reusing the previous scan for unchanged files.
+// For background goroutines; the owning goroutine uses scanHere.
 func (s *state) scan(progress library.Progress) error {
-	lib, report, err := library.ScanReport(romsRoot, s.lib, progress)
+	return s.scanWith(progress, s.commit)
+}
+
+// scanHere is scan on the owning goroutine.
+func (s *state) scanHere(progress library.Progress) error {
+	return s.scanWith(progress, s.commitHere)
+}
+
+func (s *state) scanWith(progress library.Progress, commit func(func())) error {
+	lib, report, err := library.ScanReport(romsRoot, s.snap().lib, progress)
 	if err != nil {
 		return fmt.Errorf("could not read %s: %w", romsRoot, err)
 	}
-	s.lastScan = report
-	s.lib = lib
-	s.buildInstalledIndex()
+	commit(func() {
+		s.lastScan = report
+		s.lib = lib
+		s.buildInstalledIndex()
+	})
 	s.registry.Prune()
 	return lib.Save(libraryPath())
 }
 
-// refreshIndex re-reads the patch repository when the cache is stale. A
-// failure here is not fatal: yesterday's index still describes almost the
-// same set of hacks.
+// rescan is the UI's "Rescan /roms": a scan that waits its turn behind
+// any other pipeline.
+func (s *state) rescan(progress library.Progress) error {
+	s.work.Lock()
+	defer s.work.Unlock()
+	return s.scan(progress)
+}
+
 // refreshIndex re-reads the patch repository when the cache is stale, and
 // reports whether the listing actually changed. The caller needs that:
 // fetching a newer index without rebuilding the catalog from it leaves
-// the new hacks invisible until someone runs --refresh by hand.
+// the new hacks invisible until someone runs --refresh by hand. A failure
+// is not fatal when there is a cached index: yesterday's describes almost
+// the same set of hacks.
 func (s *state) refreshIndex(ctx context.Context, force bool) (changed bool, err error) {
-	if !force && !s.index.Stale(indexMaxAge) {
+	cur := s.snap().index
+	if !force && !cur.Stale(indexMaxAge) {
 		return false, nil
 	}
 	ix, err := rapatches.Fetch(ctx, httpClient)
 	if err != nil {
-		if len(s.index.Entries) > 0 {
+		if len(cur.Entries) > 0 {
 			return false, nil // keep using the cached copy, quietly
 		}
 		return false, err
 	}
-	changed = len(ix.Entries) != len(s.index.Entries)
-	s.index = ix
-	return changed, ix.Save(indexPath())
+	changed = indexChanged(cur, ix)
+	saveErr := ix.Save(indexPath())
+	s.commit(func() { s.index = ix })
+	return changed, saveErr
+}
+
+// indexChanged compares two listings entry by entry. Comparing only their
+// length missed a week where one hack was added and another removed, and
+// any archive replaced in place by a new version.
+func indexChanged(a, b rapatches.Index) bool {
+	if len(a.Entries) != len(b.Entries) {
+		return true
+	}
+	seen := make(map[rapatches.Entry]int, len(a.Entries))
+	for _, e := range a.Entries {
+		seen[e]++
+	}
+	for _, e := range b.Entries {
+		if seen[e] == 0 {
+			return true
+		}
+		seen[e]--
+	}
+	return false
 }
 
 // rebuild identifies the base games on the device and joins them with the
 // patch index.
 func (s *state) rebuild(ctx context.Context, note func(string)) error {
-	if s.lib == nil || len(s.lib.ROMs) == 0 {
+	sn := s.snap()
+	if sn.lib == nil || len(sn.lib.ROMs) == 0 {
 		return errors.New("no ROMs found under " + romsRoot)
 	}
 	if !s.cfg.credentials().Valid() {
 		return errors.New("set your RetroAchievements API key first (--ra-login)")
 	}
-	bases, sets, err := catalog.IdentifyBases(ctx, s.ra, s.lib, note)
+	bases, sets, err := catalog.IdentifyBases(ctx, s.ra, sn.lib, note)
 	if err != nil {
 		return err
 	}
-	cats := []rapatches.Category{rapatches.Hacks}
-	if s.cfg.IncludeTranslations {
-		cats = append(cats, rapatches.Translation)
-	}
-	s.bases = bases
-	s.catalog = catalog.Build(bases, s.index, sets, s.facts, s.lib, cats...)
-	s.sets = sets
-	return s.catalog.Save(catalogPath())
+	cat := catalog.Build(bases, sn.index, sets, s.facts, sn.lib, categories(sn.translations)...)
+	saveErr := cat.Save(catalogPath())
+	s.commit(func() {
+		s.bases, s.sets, s.catalog = bases, sets, cat
+	})
+	return saveErr
 }
 
 // refreshAll is the one action behind the UI's Refresh and behind
 // --refresh: rescan, re-index, rebuild.
 func (s *state) refreshAll(ctx context.Context, note func(string)) error {
+	s.work.Lock()
+	defer s.work.Unlock()
+
 	note("Reading " + romsRoot)
 	if err := s.scan(func(done, total int, current string) {
 		if total > 0 && current != "" {
@@ -174,33 +296,54 @@ func (s *state) refreshAll(ctx context.Context, note func(string)) error {
 	return nil
 }
 
+// errBusy means another pipeline is running and this one was not started.
+var errBusy = errors.New("another refresh is running")
+
+// periodicCheck is the background look for a newer patch listing and for
+// installed hacks that have fallen behind. It never waits: if a refresh
+// is already running, that refresh does the same work, so the check is
+// skipped with errBusy. reindexed reports whether the catalog was rebuilt.
+func (s *state) periodicCheck(ctx context.Context) (reindexed, checked bool, err error) {
+	if !s.work.TryLock() {
+		return false, false, errBusy
+	}
+	defer s.work.Unlock()
+
+	// A newer listing is no use on its own: the catalog has to be rebuilt
+	// from it, or hacks that got an achievement set this week stay
+	// invisible until someone runs --refresh by hand.
+	if changed, err := s.refreshIndex(ctx, false); err == nil && changed {
+		reindexed = s.rebuild(ctx, nil) == nil
+	}
+	if !s.snap().updates.Stale(updateMaxAge) {
+		return reindexed, false, nil
+	}
+	s.checkUpdates(ctx, false, nil)
+	return reindexed, true, nil
+}
+
 // rebuildFromFacts re-runs the join with whatever fingerprints have
-// arrived, without touching the network.
+// arrived, without touching the network. Owning goroutine only.
 func (s *state) rebuildFromFacts() {
 	if len(s.bases) == 0 {
 		return
 	}
-	cats := []rapatches.Category{rapatches.Hacks}
-	if s.cfg.IncludeTranslations {
-		cats = append(cats, rapatches.Translation)
-	}
-	s.catalog = catalog.Build(s.bases, s.index, s.sets, s.facts, s.lib, cats...)
-	_ = s.catalog.Save(catalogPath())
+	cat := catalog.Build(s.bases, s.index, s.sets, s.facts, s.lib, categories(s.cfg.IncludeTranslations)...)
+	s.commitHere(func() { s.catalog = cat })
+	_ = cat.Save(catalogPath())
 }
 
 // verifyCandidates is the list of patches worth fingerprinting for this
 // device: everything on a console the user has, whose folder name is even
 // loosely related to one of their games. Generous on purpose — a wasted
 // 250 KB download costs far less than a hack the user never sees.
+// Owning goroutine only.
 func (s *state) verifyCandidates() []catalog.Candidate {
-	cats := []rapatches.Category{rapatches.Hacks}
-	if s.cfg.IncludeTranslations {
-		cats = append(cats, rapatches.Translation)
-	}
-	return catalog.Candidates(s.bases, s.index, s.facts, cats...)
+	return catalog.Candidates(s.bases, s.index, s.facts, categories(s.cfg.IncludeTranslations)...)
 }
 
 // installedHacks lists what is already on the card, for the update check.
+// Reads the guarded fields: call on the owning goroutine or under mu.
 func (s *state) installedHacks() []catalog.Installed {
 	var out []catalog.Installed
 	for _, h := range s.catalog.Hacks {
@@ -228,17 +371,19 @@ func (s *state) installedHacks() []catalog.Installed {
 // worth surfacing: the list is still correct, it is just not freshly
 // confirmed.
 func (s *state) checkUpdates(ctx context.Context, force bool, note func(string)) {
-	if !force && !s.updates.Stale(updateMaxAge) {
-		return
-	}
+	s.mu.RLock()
+	stale := s.updates.Stale(updateMaxAge)
 	installed := s.installedHacks()
-	if len(installed) == 0 {
-		s.updates = catalog.UpdateCheck{Checked: time.Now()}
-		_ = s.updates.Save(updatesPath())
+	s.mu.RUnlock()
+	if !force && !stale {
 		return
 	}
-	s.updates = catalog.CheckUpdates(ctx, s.ra, installed, note)
-	_ = s.updates.Save(updatesPath())
+	u := catalog.UpdateCheck{Checked: time.Now()}
+	if len(installed) > 0 {
+		u = catalog.CheckUpdates(ctx, s.ra, installed, note)
+	}
+	_ = u.Save(updatesPath())
+	s.commit(func() { s.updates = u })
 }
 
 func filepathBase(p string) string {
@@ -268,9 +413,13 @@ func (s *state) installHack(ctx context.Context, plan *catalog.Plan, report cata
 		Stem:      stripExt(filepathBase(dest)),
 		PatchFile: plan.Patch.Name,
 	}
-	if s.lib != nil {
-		_ = s.scan(nil)
-		for _, r := range s.lib.ROMs {
+	// The rescan waits its turn behind any running refresh, so the two
+	// never interleave; the patching above needed no turn.
+	s.work.Lock()
+	_ = s.scan(nil)
+	s.work.Unlock()
+	if lib := s.snap().lib; lib != nil {
+		for _, r := range lib.ROMs {
 			if r.Path == dest {
 				rec.RAHash = r.RAHash
 				break

@@ -10,7 +10,9 @@ import (
 )
 
 // romsRoot is where dArkOS/EmulationStation keeps ROMs on the Miniloong.
-const romsRoot = "/roms"
+// romsRoot is where the system folders live. A var only so tests can point
+// it at a temporary tree.
+var romsRoot = "/roms"
 
 // Config is the small amount of state this app owns. The only thing it
 // really needs is a RetroAchievements web API key, which the user copies
