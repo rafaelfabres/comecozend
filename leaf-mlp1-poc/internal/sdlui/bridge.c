@@ -908,12 +908,15 @@ void bridge_draw_footer_chips(const char *spec) {
         const char *end = strchr(p, '\n');
         size_t len = end ? (size_t)(end - p) : strlen(p);
         const char *tab = memchr(p, '\t', len);
-        size_t klen = tab ? (size_t)(tab - p) : len;
-        if (klen > 31) klen = 31;
+        size_t full = tab ? (size_t)(tab - p) : len;
+        size_t klen = full > 31 ? 31 : full;
         memcpy(keys[n], p, klen); keys[n][klen] = 0;
         labels[n][0] = 0;
         if (tab) {
-            size_t llen = len - klen - 1;
+            // Measured from the real tab, not the shortened key: with a
+            // key past 31 bytes the label used to start inside the key and
+            // the copy read past the end of the item.
+            size_t llen = len - full - 1;
             if (llen > 63) llen = 63;
             memcpy(labels[n], tab + 1, llen); labels[n][llen] = 0;
         }
