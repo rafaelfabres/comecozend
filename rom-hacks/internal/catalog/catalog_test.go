@@ -209,11 +209,18 @@ func TestInstallRefusesUnrecognisedResult(t *testing.T) {
 		Expected: wrong, Supported: []rahub.HashEntry{wrong},
 		Payload: payload,
 	}
-	if _, err := Install(plan, root); err == nil {
+	_, err := Install(plan, root)
+	if err == nil {
 		t.Fatal("expected the install to be refused")
 	}
 	if entries, err := os.ReadDir(filepath.Join(snes, "hacks")); err == nil && len(entries) > 0 {
 		t.Fatalf("a file was written despite the hash mismatch: %v", entries)
+	}
+	// With a single copy on the card there is nothing else to try, so
+	// the message must be the one that says what went wrong — not
+	// "none of your 1 copies".
+	if strings.Contains(err.Error(), "copies") || !strings.Contains(err.Error(), "RetroAchievements") {
+		t.Errorf("unhelpful message for a single copy: %v", err)
 	}
 }
 

@@ -391,10 +391,12 @@ func pickForConsole(hits []library.ROM, consoleID int) library.ROM {
 // Cheap for a cartridge — a few megabytes read per attempt — and skipped
 // for discs, where each attempt would mean extracting 600 MB again.
 func tryOtherCopies(p *Plan, console rahub.Console, report Reporter) ([]byte, rahub.HashEntry, error) {
+	tried := 0
 	for _, alt := range p.Bases {
 		if alt.Path == p.Base.Path || alt.Disc {
 			continue
 		}
+		tried++
 		report.stage(Stage("Trying " + alt.Name()))
 		source, err := library.Read(alt)
 		if err != nil {
@@ -408,10 +410,17 @@ func tryOtherCopies(p *Plan, console rahub.Console, report Reporter) ([]byte, ra
 			return patched, matched, nil
 		}
 	}
+	if tried == 0 {
+		return nil, rahub.HashEntry{}, errNoOtherCopies
+	}
 	return nil, rahub.HashEntry{}, fmt.Errorf(
 		"none of your %d copies of %s produced a file RetroAchievements knows",
 		len(p.Bases), p.Hack.BaseTitle)
 }
+
+// errNoOtherCopies means the card holds no other copy of the base game to
+// fall back to.
+var errNoOtherCopies = errors.New("no other copy of the base game to try")
 
 // applyUntilSupported patches the base ROM and checks the result against
 // every file RetroAchievements accepts for the set.
@@ -618,7 +627,13 @@ func InstallWithProgress(p *Plan, romsRoot string, report Reporter) (string, err
 		// and a (USA, Europe) (Rev 1) — and a patch that declares no
 		// checksum cannot say which one it wants. Giving up after the
 		// first is giving up early.
+		firstErr := err
 		patched, matched, err = tryOtherCopies(p, console, report)
+		if errors.Is(err, errNoOtherCopies) {
+			// Nothing else to try: the first answer is the useful one
+			// ("this patch needs <dump>"), not "none of your 1 copies".
+			return "", firstErr
+		}
 		if err != nil {
 			return "", err
 		}

@@ -1475,6 +1475,15 @@ func (a *ui) deleteInstalled() {
 		a.manage.SetError("This hack is not installed any more")
 		return
 	}
+	// Only a file this app recorded installing may be deleted from here.
+	// installedPath also matches by title in any hacks/ folder, and plenty
+	// of cards already have a hacks/ folder of the user's own: deleting
+	// one of those because its name looked like this set's is not ours
+	// to do.
+	if rec, recorded := a.registry.Get(a.current.GameID); !recorded || rec.Path != path {
+		a.manage.SetError("This file was not installed by this app, so it is left alone. Delete it from a file manager if you want it gone.")
+		return
+	}
 	// A disc is a cue plus one file per track; every track the cue names
 	// beside it goes too. Read before the cue itself is removed.
 	var tracks []string
@@ -1797,6 +1806,9 @@ func (a *ui) startVerify() {
 	}
 	candidates := a.verifyCandidates()
 	if len(candidates) == 0 {
+		// Release the claim, or every later pass this session — after a
+		// refresh brings new hacks, say — would see a pass "running".
+		a.verifying.Store(false)
 		return
 	}
 	go func() {
