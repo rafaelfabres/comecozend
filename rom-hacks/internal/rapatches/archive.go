@@ -20,7 +20,7 @@ import (
 // large ones: three in the repository pass 70 MB, because an xdelta
 // against a 600 MB disc is itself big. The file lands on the card, so
 // this is a disk ceiling with 74 GB behind it, not a RAM one.
-const maxArchive = 1 << 30
+var maxArchive int64 = 1 << 30 // a var so tests can lower it
 
 // maxInMemory is the separate, much lower ceiling for the calls that do
 // buffer an archive — the background fingerprint pass. Sharing one
@@ -31,7 +31,7 @@ const maxInMemory = 64 << 20
 // ErrTooLarge means the archive is bigger than the caller is willing to
 // hold in memory. It is not a failure of the archive: fetching it to disk
 // still works.
-var ErrTooLarge = errors.New("archive is larger than the in-memory limit")
+var ErrTooLarge = errors.New("archive is larger than this app will download")
 
 // eagerEntryBytes is how large a file inside an archive may be before it
 // is left on disk instead of being decompressed into memory.
@@ -72,15 +72,23 @@ type PatchFile struct {
 // they were too large to keep in memory. The result is cached, so asking
 // twice costs one read.
 func (p *PatchFile) Bytes() []byte {
+	data, _ := p.Load()
+	return data
+}
+
+// Load is Bytes with the read error kept. Bytes returns nil when the entry
+// cannot be read, which callers then reported as "not a patch format this
+// app understands" — true of nil, and no help with a damaged archive.
+func (p *PatchFile) Load() ([]byte, error) {
 	if p.Data != nil || p.load == nil {
-		return p.Data
+		return p.Data, nil
 	}
 	data, err := p.load()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	p.Data = data
-	return data
+	return data, nil
 }
 
 // Stem is the filename without its extension. RetroAchievements names a
@@ -146,11 +154,21 @@ func DownloadTo(ctx context.Context, client *http.Client, e Entry, dir string) (
 	}
 	defer resp.Body.Close()
 
+	if resp.ContentLength > maxArchive {
+		return "", fmt.Errorf("%s: %w (%d MB)", e.File, ErrTooLarge, resp.ContentLength>>20)
+	}
 	f, err := os.CreateTemp(dir, "patch-*"+path.Ext(e.File))
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(f, io.LimitReader(resp.Body, maxArchive)); err != nil {
+	// One byte past the cap tells "exactly at the limit" from "cut off".
+	// Stopping at the cap and calling it done kept the first gigabyte of a
+	// bigger archive, which then failed as "not a valid zip".
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxArchive+1))
+	if err == nil && n > maxArchive {
+		err = ErrTooLarge
+	}
+	if err != nil {
 		f.Close()
 		os.Remove(f.Name())
 		return "", fmt.Errorf("download %s: %w", e.File, err)

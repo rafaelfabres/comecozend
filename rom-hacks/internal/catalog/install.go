@@ -165,7 +165,12 @@ func Resolve(ctx context.Context, httpClient *http.Client, ra *rahub.RAClient, h
 	}
 
 	chosen, expected, alts := choosePatch(payload, hashes)
-	format := patch.Detect(chosen.Bytes())
+	data, err := chosen.Load()
+	if err != nil {
+		discard()
+		return nil, fmt.Errorf("could not read %s from the downloaded archive: %w", filepath.Base(chosen.Name), err)
+	}
+	format := patch.Detect(data)
 	if format == patch.Unknown {
 		discard()
 		return nil, fmt.Errorf("%s is not a patch format this app understands", filepath.Base(chosen.Name))
