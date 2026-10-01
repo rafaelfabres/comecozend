@@ -1,0 +1,71 @@
+package itchio
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+)
+
+// GamesCacheRevision identifies the feed/platform coverage represented by the
+// cache. Bump it whenever AllPlatforms changes so a fresh-but-incomplete cache
+// is refreshed in the background after an app update.
+const GamesCacheRevision = 1
+
+// CacheMeta records when the cache was last populated.
+type CacheMeta struct {
+	Revision   int       `json:"revision"`
+	FetchedAt  time.Time `json:"fetched_at"`
+	TotalGames int       `json:"total_games"`
+}
+
+// GameCache is the on-disk representation of the full game list.
+type GameCache struct {
+	Meta  CacheMeta `json:"meta"`
+	Games []Game    `json:"games"`
+}
+
+func (cache *GameCache) CurrentRevision() bool {
+	return cache != nil && cache.Meta.Revision == GamesCacheRevision
+}
+
+// SaveGamesCache writes games to path atomically (write to .tmp then rename).
+func SaveGamesCache(path string, games []Game) error {
+	cache := GameCache{
+		Meta:  CacheMeta{Revision: GamesCacheRevision, FetchedAt: time.Now(), TotalGames: len(games)},
+		Games: games,
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return fmt.Errorf("marshal game cache: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("write game cache tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename game cache: %w", err)
+	}
+	return nil
+}
+
+// LoadGamesCache reads and parses the cache file at path.
+// Returns an error if the file is missing or unparseable.
+func LoadGamesCache(path string) (*GameCache, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read game cache: %w", err)
+	}
+	var cache GameCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, fmt.Errorf("parse game cache: %w", err)
+	}
+	for i := range cache.Games {
+		g := &cache.Games[i]
+		if g.Title == "" || !hasLetter(g.Title) {
+			g.Title = SlugToTitle(g.URL)
+		}
+	}
+	return &cache, nil
+}

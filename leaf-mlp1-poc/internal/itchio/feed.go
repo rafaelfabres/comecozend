@@ -1,0 +1,511 @@
+package itchio
+
+import (
+	"context"
+	"encoding/xml"
+	"html"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	neturl "net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"leaf-mlp1-poc/internal/logger"
+)
+
+const (
+	feedMaxRetries = 3
+	feedRetryDelay = 2 * time.Second
+)
+
+type Game struct {
+	Title       string    `json:"title"`
+	Author      string    `json:"author"`
+	URL         string    `json:"url"`
+	CoverURL    string    `json:"cover_url"`
+	Price       float64   `json:"price"`
+	IsFree      bool      `json:"is_free"`
+	Tags        []string  `json:"tags,omitempty"`     // extracted from [Tag] brackets in the RSS title
+	PublishedAt time.Time `json:"published_at"`       // parsed from <pubDate> in RSS feed
+	Platform    string    `json:"platform,omitempty"` // Leaf system code set by FetchAllGames, e.g. "GB"
+	// Blurb is the short summary from the feed's <description>, with its
+	// HTML stripped. The upstream parser already reads this element (to
+	// find the cover <img>) and then dropped it; keeping it gives the list
+	// screen a one-line description without a page fetch per game.
+	Blurb string `json:"blurb,omitempty"`
+	// Rank is this game's position in itch.io's own popularity order for its
+	// feed, captured by a short popularity pass during the catalog walk.
+	// 0 means "not ranked" (outside the top pages), which sorts last.
+	Rank int `json:"rank,omitempty"`
+	// Adult marks a game found through an adult-tagged feed.
+	Adult bool `json:"adult,omitempty"`
+}
+
+var (
+	coverRegex = regexp.MustCompile(`<img[^>]+src="([^"]+)"`)
+	tagRegex   = regexp.MustCompile(`\s*\[([^\]]+)\]`)
+)
+
+// parseTitle strips [Tag] brackets from the raw RSS title.
+func parseTitle(raw string) string {
+	return strings.TrimSpace(tagRegex.ReplaceAllString(raw, ""))
+}
+
+// parseTags extracts the contents of every [Tag] bracket in the raw RSS title.
+func parseTags(raw string) []string {
+	matches := tagRegex.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) > 1 && m[1] != "" {
+			tags = append(tags, m[1])
+		}
+	}
+	return tags
+}
+
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	ImageURL    string `xml:"imageurl"`
+	Price       string `xml:"price"`
+	PubDate     string `xml:"pubDate"`
+}
+
+type rssFeed struct {
+	Items []rssItem `xml:"channel>item"`
+}
+
+type metadataHTTPError struct {
+	operation string
+	status    int
+}
+
+func (err *metadataHTTPError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d", err.operation, err.status)
+}
+
+func retryableMetadataError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrCloudflareBlocked) {
+		return false
+	}
+	var statusErr *metadataHTTPError
+	if errors.As(err, &statusErr) {
+		switch statusErr.status {
+		case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+			http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SlugToTitle derives a display title from the URL slug when the RSS title is
+// empty. It extracts the path segment after ".itch.io/", splits on hyphens and
+// underscores, and capitalises the first letter of each word.
+func SlugToTitle(gameURL string) string {
+	s := gameURL
+	if idx := strings.Index(s, ".itch.io/"); idx >= 0 {
+		s = s[idx+len(".itch.io/"):]
+	}
+	if idx := strings.Index(s, "/"); idx >= 0 {
+		s = s[:idx]
+	}
+	words := strings.FieldsFunc(s, func(r rune) bool { return r == '-' || r == '_' })
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+// hasLetter reports whether s contains at least one Unicode letter.
+func hasLetter(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseAuthor(gameURL string) string {
+	// https://{author}.itch.io/{game}
+	s := strings.TrimPrefix(gameURL, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	if idx := strings.Index(s, ".itch.io"); idx > 0 {
+		return s[:idx]
+	}
+	return ""
+}
+
+func parseCover(imageURL, desc string) string {
+	if imageURL != "" {
+		return imageURL
+	}
+	m := coverRegex.FindStringSubmatch(desc)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+func parsePrice(raw string) float64 {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, "$€£¥")
+	s = strings.TrimSpace(s)
+	price, _ := strconv.ParseFloat(s, 64)
+	return price
+}
+
+func parsePubDate(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC1123, time.RFC1123Z} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t
+		}
+	}
+	logger.Warn("feed: unrecognised pubDate format %q, treating as undated", raw)
+	return time.Time{}
+}
+
+func (c *Client) FetchGamesFromURL(url string) ([]Game, error) {
+	return c.FetchGamesFromURLContext(context.Background(), url)
+}
+
+// FetchGamesFromURLContext fetches idempotent catalogue metadata. Only
+// transient transport/server failures are retried, and both requests and retry
+// waits stop immediately when ctx is cancelled.
+func (c *Client) FetchGamesFromURLContext(ctx context.Context, url string) ([]Game, error) {
+	var lastErr error
+	for attempt := 0; attempt <= feedMaxRetries; attempt++ {
+		if attempt > 0 {
+			logger.Warn("feed: retry %d/%d after %v (last error: %v)", attempt, feedMaxRetries, feedRetryDelay, lastErr)
+			if err := waitForRetry(ctx, feedRetryDelay); err != nil {
+				return nil, err
+			}
+		}
+		games, err := c.fetchGamesFromURLOnce(ctx, url)
+		if err == nil {
+			return games, nil
+		}
+		lastErr = err
+		if !retryableMetadataError(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) fetchGamesFromURLOnce(ctx context.Context, url string) ([]Game, error) {
+	logger.Debug("feed: fetching %s", url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build feed request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch feed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		logger.Error("feed: HTTP 403 from %s (Cloudflare bot-protection)", url)
+		return nil, ErrCloudflareBlocked
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("feed: HTTP %d from %s", resp.StatusCode, url)
+		return nil, &metadataHTTPError{operation: "fetch feed", status: resp.StatusCode}
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read feed: %w", err)
+	}
+
+	var feed rssFeed
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		logger.Error("feed: parse XML: %v", err)
+		logger.Debug("feed: response body (first 512 bytes): %.512s", body)
+		return nil, fmt.Errorf("parse feed xml: %w", err)
+	}
+	logger.Debug("feed: parsed %d items from XML", len(feed.Items))
+
+	games := make([]Game, 0, len(feed.Items))
+	for _, item := range feed.Items {
+		price := parsePrice(item.Price)
+		title := parseTitle(item.Title)
+		if title == "" || !hasLetter(title) {
+			title = SlugToTitle(item.Link)
+			logger.Warn("feed: item %s has no readable title %q, using slug fallback %q", item.Link, parseTitle(item.Title), title)
+		}
+		games = append(games, Game{
+			Title:       title,
+			Tags:        parseTags(item.Title),
+			Author:      parseAuthor(item.Link),
+			URL:         item.Link,
+			CoverURL:    parseCover(item.ImageURL, item.Description),
+			Price:       price,
+			IsFree:      price == 0,
+			PublishedAt: parsePubDate(item.PubDate),
+			Blurb:       parseBlurb(item.Description),
+		})
+	}
+	return games, nil
+}
+
+// parseBlurb turns the feed's HTML description into one line of plain text:
+// tags removed, entities decoded, whitespace collapsed, and truncated so a
+// list row can show it.
+func parseBlurb(description string) string {
+	if description == "" {
+		return ""
+	}
+	text := blurbTagRegex.ReplaceAllString(description, " ")
+	text = html.UnescapeString(text)
+	text = strings.Join(strings.Fields(text), " ")
+	const maxBlurb = 160
+	if len(text) > maxBlurb {
+		text = strings.TrimSpace(text[:maxBlurb]) + "..."
+	}
+	return text
+}
+
+var blurbTagRegex = regexp.MustCompile(`<[^>]*>`)
+
+const PerPage = 36 // itch.io XML feeds return 36 items per page
+
+// FetchGames fetches one page of the GB Studio feed. It is used as a quick
+// live-feed preview when no local cache exists yet; the full multi-platform
+// catalogue is built by FetchAllGames.
+func (c *Client) FetchGames(page int, query string) ([]Game, error) {
+	return c.FetchGamesContext(context.Background(), page, query)
+}
+
+func (c *Client) FetchGamesContext(ctx context.Context, page int, query string) ([]Game, error) {
+	feedURL := fmt.Sprintf("%s/games/made-with-gb-studio.xml?page=%d", c.base, page)
+	if query != "" {
+		feedURL += "&q=" + neturl.QueryEscape(query)
+	}
+	return c.FetchGamesFromURLContext(ctx, feedURL)
+}
+
+// feedConcurrency is the maximum number of feed slugs fetched in parallel.
+// All requests share the same HTTP/2 connection to itch.io, so this caps
+// the number of concurrent in-flight page requests rather than connections.
+const feedConcurrency = 3
+
+type slugResult struct {
+	platformCode string
+	games        []Game
+	err          error
+}
+
+// fetchSlug fetches all pages for one feed slug and returns every game found.
+// It maintains its own seen-URL set purely for within-slug wrap-around
+// detection (itch.io repeats the last real page indefinitely past the end).
+// onPage is called after each page that adds at least one new game; the
+// argument is the running total of games found so far within this slug.
+func (c *Client) fetchSlug(ctx context.Context, platformCode, slug string, onPage func(n int)) ([]Game, error) {
+	logger.Info("feed: fetching platform=%s slug=%s", platformCode, slug)
+	localSeen := make(map[string]bool)
+	var games []Game
+	for page := 1; ; page++ {
+		select {
+		case <-ctx.Done():
+			return games, ctx.Err()
+		default:
+		}
+		url := fmt.Sprintf("%s/games/%s.xml?page=%d", c.base, slug, page)
+		pageGames, err := c.FetchGamesFromURLContext(ctx, url)
+		if err != nil {
+			logger.Warn("feed: platform=%s slug=%s page=%d error: %v", platformCode, slug, page, err)
+			return games, fmt.Errorf("platform=%s slug=%s page %d: %w", platformCode, slug, page, err)
+		}
+		added := 0
+		for i := range pageGames {
+			if !localSeen[pageGames[i].URL] {
+				localSeen[pageGames[i].URL] = true
+				pageGames[i].Platform = platformCode
+				games = append(games, pageGames[i])
+				added++
+			}
+		}
+		logger.Debug("feed: platform=%s slug=%s page=%d: %d new, %d deduped", platformCode, slug, page, added, len(pageGames)-added)
+		if added > 0 && onPage != nil {
+			onPage(added)
+		}
+		if len(pageGames) < PerPage {
+			break
+		}
+		if added == 0 {
+			logger.Debug("feed: platform=%s slug=%s page=%d: full page all-duplicates, stopping (itch.io wrap-around)", platformCode, slug, page)
+			break
+		}
+	}
+	return games, nil
+}
+
+// FetchAllGames fetches every page of every platform feed in AllPlatforms in
+// parallel (up to feedConcurrency slugs at a time), deduplicates games by URL
+// across platforms, and returns the merged list. progress is called after each
+// slug completes. If a slug errors, its games are skipped and the error is
+// recorded; partial results from other slugs are always returned.
+func (c *Client) FetchAllGames(ctx context.Context, progress func(partial []Game)) ([]Game, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Enumerate all (platform, slug) pairs.
+	type slugSpec struct {
+		platformCode string
+		slug         string
+	}
+	var specs []slugSpec
+	for _, p := range AllPlatforms {
+		for _, s := range p.FeedSlugs {
+			specs = append(specs, slugSpec{p.Code, s})
+		}
+	}
+
+	resultCh := make(chan slugResult, len(specs))
+	// pingCh carries per-page notifications from goroutines so the collect loop
+	// can fire progress(all) more frequently than once per completed slug.
+	// Capacity = len(specs)*2 to avoid blocking goroutines on a slow main loop.
+	pingCh := make(chan struct{}, len(specs)*2)
+	sem := make(chan struct{}, feedConcurrency)
+
+	for _, spec := range specs {
+		spec := spec
+		go func() {
+			// Acquire semaphore slot, or abort if context is cancelled.
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				resultCh <- slugResult{err: ctx.Err()}
+				return
+			}
+			games, err := c.fetchSlug(ctx, spec.platformCode, spec.slug, func(_ int) {
+				select {
+				case pingCh <- struct{}{}:
+				default:
+				}
+			})
+			resultCh <- slugResult{platformCode: spec.platformCode, games: games, err: err}
+		}()
+	}
+
+	// Collect results as slugs complete; merge sequentially (no mutex needed).
+	// Pings from in-flight goroutines also fire progress so the caller sees
+	// live updates during long slug fetches (e.g. the large P8 feed).
+	seen := make(map[string]bool)
+	var all []Game
+	var lastErr error
+	remaining := len(specs)
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			return all, ctx.Err()
+		case <-pingCh:
+			// A goroutine finished a page — fire a live-count progress update
+			// using whatever has been merged so far. Drain all pending pings to
+			// avoid a flood of identical callbacks.
+			for len(pingCh) > 0 {
+				<-pingCh
+			}
+			if progress != nil {
+				progress(all)
+			}
+		case r := <-resultCh:
+			remaining--
+			if r.err != nil {
+				if errors.Is(r.err, context.Canceled) {
+					return all, r.err
+				}
+				lastErr = r.err
+				continue
+			}
+			added := 0
+			for _, g := range r.games {
+				if !seen[g.URL] {
+					seen[g.URL] = true
+					all = append(all, g)
+					added++
+				}
+			}
+			logger.Debug("feed: platform=%s merged %d game(s) (%d cross-platform deduped)", r.platformCode, added, len(r.games)-added)
+			if added > 0 && progress != nil {
+				progress(all)
+			}
+		}
+	}
+	return all, lastErr
+}
+
+var resultCountRegex = regexp.MustCompile(`(?i)(\d[\d,]*)\s+result`)
+
+// FetchTotalGames scrapes the HTML browse page to find the total result count.
+func (c *Client) FetchTotalGames() (int, error) {
+	logger.Debug("feed: fetching total games count")
+	resp, err := c.http.Get("https://itch.io/games/made-with-gb-studio")
+	if err != nil {
+		return 0, fmt.Errorf("fetch browse page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		logger.Error("feed: total-games HTTP 403 (Cloudflare bot-protection)")
+		return 0, fmt.Errorf("fetch total games: %w", ErrCloudflareBlocked)
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("feed: total-games HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("fetch total games: HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("read browse page: %w", err)
+	}
+	m := resultCountRegex.FindStringSubmatch(string(body))
+	if len(m) < 2 {
+		logger.Warn("feed: result count not found on browse page")
+		return 0, fmt.Errorf("result count not found on browse page")
+	}
+	countStr := strings.ReplaceAll(m[1], ",", "")
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return 0, fmt.Errorf("parse result count: %w", err)
+	}
+	return count, nil
+}

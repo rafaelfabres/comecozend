@@ -1,0 +1,469 @@
+package itchio
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"leaf-mlp1-poc/internal/logger"
+	"leaf-mlp1-poc/internal/roms"
+	"golang.org/x/net/html"
+)
+
+type GameDetail struct {
+	Game
+	Description    string
+	ScreenshotURLs []string
+	Uploads        []Upload
+	GameID         string
+	CSRFToken      string
+	PageTags       []string // itch.io tag labels scraped from the game page
+	BundleNames    []string // names of bundles that include this game (from public page)
+	BrowserOnly    bool     // true when page has HTML5 embed but no downloadable or paid files
+}
+
+type Upload struct {
+	Filename    string
+	URL         string // resolver or CDN URL
+	UploadID    string // itch.io upload ID (from data-upload_id)
+	NeedsFormat bool   // true if extension is unknown and needs a manual format choice
+	// Version is the build version itch.io shows under the file
+	// ("Version 1.0.7"), when the developer uploads with versions.
+	Version string
+}
+
+var uploadVersionRe = regexp.MustCompile(`(?i)\bversion\s+([0-9][0-9a-z.\-_]*)`)
+
+var (
+	// itch:path meta tag — attribute order varies across pages, so we match
+	// the whole <meta> element containing "itch:path" and extract the game ID
+	// from its content attribute in a second pass.
+	gameIDTagRegex   = regexp.MustCompile(`<meta[^>]+itch:path[^>]+>`)
+	gameIDValueRegex = regexp.MustCompile(`content="games/(\d+)"`)
+	csrfRegex        = regexp.MustCompile(`name="csrf_token"\s+(?:content|value)="([^"]+)"`)
+	// tag links: <a href="https://itch.io/games/tag-horror">Horror</a>
+	// Capture the slug from the URL (e.g. "horror", "lgbtq") for reliable filter matching.
+	pageTagRegex = regexp.MustCompile(`href="https://itch\.io/games/tag-([^"]+)"`)
+	// bundle_title div: <div class="bundle_title"><a href="...">Bundle Name</a></div>
+	bundleNameRegex = regexp.MustCompile(`(?s)<div\s+class="bundle_title"[^>]*>\s*<a[^>]*>\s*([^<]+?)\s*</a>`)
+)
+
+func (c *Client) FetchGameDetail(gameURL string) (*GameDetail, error) {
+	logger.Debug("game: fetching detail %s", gameURL)
+	resp, err := c.http.Get(gameURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch game page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return nil, fmt.Errorf("fetch game detail: %w", ErrGameRemoved)
+	}
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("game: detail page HTTP %d for %s", resp.StatusCode, gameURL)
+		return nil, fmt.Errorf("fetch game detail: HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read game page: %w", err)
+	}
+	s := string(body)
+
+	detail := &GameDetail{}
+
+	if tag := gameIDTagRegex.FindString(s); tag != "" {
+		if m := gameIDValueRegex.FindStringSubmatch(tag); len(m) > 1 {
+			detail.GameID = m[1]
+		}
+	}
+	if detail.GameID == "" {
+		logger.Warn("game: gameID not found on page (paid download will not work)")
+	} else {
+		logger.Debug("game: gameID=%q", detail.GameID)
+	}
+
+	if m := csrfRegex.FindStringSubmatch(s); len(m) > 1 {
+		detail.CSRFToken = m[1]
+	} else {
+		logger.Warn("game: CSRF token not found on page")
+	}
+
+	// Extract itch.io page tags from tag links
+	for _, m := range pageTagRegex.FindAllStringSubmatch(s, -1) {
+		if len(m) > 1 {
+			detail.PageTags = append(detail.PageTags, strings.TrimSpace(m[1]))
+		}
+	}
+	logger.Debug("game: %d page tags: %v", len(detail.PageTags), detail.PageTags)
+
+	detail.ScreenshotURLs = extractScreenshotURLs(body)
+	logger.Debug("game: %d screenshots found", len(detail.ScreenshotURLs))
+
+	// Extract game description from formatted_description div
+	detail.Description = extractDescription(s)
+
+	// Extract bundle names from bundle_title divs (present when the game is in a bundle).
+	// The same bundle name can appear multiple times on the page (purchase banner +
+	// related-items section), so deduplicate while preserving order.
+	seen := map[string]bool{}
+	for _, m := range bundleNameRegex.FindAllStringSubmatch(s, -1) {
+		if len(m) > 1 {
+			name := strings.TrimSpace(m[1])
+			if !seen[name] {
+				seen[name] = true
+				detail.BundleNames = append(detail.BundleNames, name)
+			}
+		}
+	}
+	logger.Debug("game: %d bundle name(s): %v", len(detail.BundleNames), detail.BundleNames)
+
+	// Detect browser-only: page has an HTML5 game embed but no free-download or
+	// purchase button visible to anonymous users.
+	hasHTML5Embed := strings.Contains(s, "html.itch.zone")
+	hasDownloadBtn := strings.Contains(s, "download_btn")
+	hasBuySection := strings.Contains(s, "buy_row")
+	detail.BrowserOnly = hasHTML5Embed && !hasDownloadBtn && !hasBuySection
+	logger.Debug("game: browserOnly=%v (embed=%v downloadBtn=%v buySection=%v)",
+		detail.BrowserOnly, hasHTML5Embed, hasDownloadBtn, hasBuySection)
+
+	return detail, nil
+}
+
+// extractScreenshotURLs walks the parsed HTML and returns the src of every
+// <img> element that carries the "screenshot" CSS class. Using the HTML parser
+// makes this order-independent (src may appear before or after class).
+func extractScreenshotURLs(rawHTML []byte) []string {
+	doc, err := html.Parse(bytes.NewReader(rawHTML))
+	if err != nil {
+		return nil
+	}
+	var urls []string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "img" && nodeHasClass(n, "screenshot") {
+			for _, a := range n.Attr {
+				if a.Key == "src" && a.Val != "" {
+					urls = append(urls, a.Val)
+					break
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return urls
+}
+
+// extractDescription pulls the game description from the page HTML and
+// returns a lightweight markup string preserving paragraph, heading, and
+// list structure while stripping scripts, embeds, links, and unknown tags.
+// Inline <strong>/<b>/<em>/<i> are normalised to <b>; headings to <h2>.
+func extractDescription(pageHTML string) string {
+	doc, err := html.Parse(strings.NewReader(pageHTML))
+	if err != nil {
+		return ""
+	}
+
+	// Find the first div whose class contains "formatted_description".
+	var descNode *html.Node
+	var findDiv func(*html.Node)
+	findDiv = func(n *html.Node) {
+		if descNode != nil {
+			return
+		}
+		if n.Type == html.ElementNode && n.Data == "div" {
+			for _, a := range n.Attr {
+				if a.Key == "class" && strings.Contains(a.Val, "formatted_description") {
+					descNode = n
+					return
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			findDiv(c)
+		}
+	}
+	findDiv(doc)
+	if descNode == nil {
+		return ""
+	}
+
+	// Convert the subtree to lightweight markup, preserving block structure.
+	var buf bytes.Buffer
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "button", "iframe", "video", "audio", "script", "style", "a":
+				return // strip entirely
+			case "br":
+				buf.WriteString("<br>")
+				return
+			case "p":
+				buf.WriteString("<p>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</p>")
+				return
+			case "h1", "h2", "h3", "h4", "h5", "h6":
+				buf.WriteString("<h2>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</h2>")
+				return
+			case "strong", "b", "em", "i":
+				buf.WriteString("<b>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</b>")
+				return
+			case "ul":
+				buf.WriteString("<ul>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</ul>")
+				return
+			case "ol":
+				buf.WriteString("<ol>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</ol>")
+				return
+			case "li":
+				buf.WriteString("<li>")
+				for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
+				buf.WriteString("</li>")
+				return
+			case "tr":
+				buf.WriteString("<br>")
+			case "td", "th":
+				if buf.Len() > 0 {
+					buf.WriteString(" ")
+				}
+			}
+		}
+		if n.Type == html.TextNode {
+			buf.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(descNode)
+
+	return strings.TrimSpace(buf.String())
+}
+
+// DownloadPageResult holds what ParseDownloadPage extracts from the signed page.
+type DownloadPageResult struct {
+	Uploads   []Upload
+	CSRFToken string // CSRF token from the signed download page (needed for file resolver POST)
+}
+
+// ParseDownloadPage fetches the itch.io signed download page and returns all
+// .gb/.gbc uploads found (with UploadID set) plus the page's CSRF token.
+// The CSRF token must be included in the body of the subsequent file resolver POST.
+func (c *Client) ParseDownloadPage(pageURL string) (*DownloadPageResult, error) {
+	// The signed URL contains a download key — do not log it.
+	logger.Debug("download-page: fetching signed download page")
+	resp, err := c.http.Get(pageURL)
+	if err != nil {
+		return nil, safeRequestError("fetch download page", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("download-page: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetch download page: HTTP %d", resp.StatusCode)
+	}
+
+	rawHTML, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read download page: %w", err)
+	}
+	return ParseUploadsHTML(rawHTML)
+}
+
+// ParseUploadsHTML reads the upload list (<div class="upload"> entries with
+// a data-upload_id button) from a download page — or from a game page whose
+// files are downloadable right there, with no purchase step.
+func ParseUploadsHTML(rawHTML []byte) (*DownloadPageResult, error) {
+	pageStr := string(rawHTML)
+	result := &DownloadPageResult{}
+
+	// Extract CSRF token — log presence only, never the value.
+	if m := csrfRegex.FindStringSubmatch(pageStr); len(m) > 1 {
+		result.CSRFToken = m[1]
+		logger.Debug("download-page: CSRF token present")
+	} else {
+		logger.Warn("download-page: CSRF token not found (resolver POST may fail)")
+	}
+
+	doc, err := html.Parse(bytes.NewReader(rawHTML))
+	if err != nil {
+		return nil, fmt.Errorf("parse download page: %w", err)
+	}
+
+	var walkDoc func(*html.Node)
+	walkDoc = func(n *html.Node) {
+		// Find each <div class="upload"> and extract upload info from it
+		if n.Type == html.ElementNode && n.Data == "div" && nodeHasClass(n, "upload") {
+			if u, ok := extractUploadEntry(n); ok {
+				ext := strings.ToLower(roms.ROMExt(u.Filename))
+				if roms.IsSupportedUploadExt(ext) {
+					logger.Debug("download-page: found ROM %s id=%s", u.Filename, u.UploadID)
+					result.Uploads = append(result.Uploads, u)
+				} else if !isSkippableExt(ext) {
+					u.NeedsFormat = true
+					logger.Debug("download-page: found unknown-format %s id=%s (user will choose format)", u.Filename, u.UploadID)
+					result.Uploads = append(result.Uploads, u)
+				} else {
+					logger.Debug("download-page: skipping %s (ext=%q)", u.Filename, ext)
+				}
+			}
+			return // don't recurse into upload divs
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walkDoc(c)
+		}
+	}
+	walkDoc(doc)
+
+	// Deduplicate: some games have multiple uploads with the same filename
+	// (e.g. after a developer re-upload). Keep the one with the highest upload
+	// ID (most recently uploaded) so only one copy is downloaded.
+	result.Uploads = deduplicateUploadsByFilename(result.Uploads)
+
+	knownCount := 0
+	for _, u := range result.Uploads {
+		if !u.NeedsFormat {
+			knownCount++
+		}
+	}
+	logger.Info("download-page: %d known ROM(s), %d unknown-format file(s)",
+		knownCount, len(result.Uploads)-knownCount)
+	return result, nil
+}
+
+// deduplicateUploadsByFilename keeps one Upload per unique Filename, preferring
+// the entry with the highest numeric UploadID (most recently re-uploaded version).
+// Relative order of the surviving entries is preserved.
+func deduplicateUploadsByFilename(uploads []Upload) []Upload {
+	if len(uploads) <= 1 {
+		return uploads
+	}
+	// Find the winning UploadID for each filename.
+	best := make(map[string]int) // filename → highest numeric ID seen
+	bestStr := make(map[string]string)
+	for _, u := range uploads {
+		id, _ := strconv.Atoi(u.UploadID)
+		if prev, ok := best[u.Filename]; !ok || id > prev {
+			best[u.Filename] = id
+			bestStr[u.Filename] = u.UploadID
+		}
+	}
+	if len(best) == len(uploads) {
+		return uploads // no duplicates
+	}
+	// Rebuild in original order, taking only the winner for each filename.
+	out := make([]Upload, 0, len(best))
+	taken := make(map[string]bool)
+	for _, u := range uploads {
+		if taken[u.Filename] {
+			logger.Warn("download-page: skipping duplicate upload %s id=%s (keeping id=%s)",
+				u.Filename, u.UploadID, bestStr[u.Filename])
+			continue
+		}
+		if u.UploadID == bestStr[u.Filename] {
+			out = append(out, u)
+			taken[u.Filename] = true
+		}
+	}
+	// Any winner not yet emitted (because the loser appeared first in the list)
+	// needs a second pass; sort remaining by filename for determinism.
+	if len(out) < len(best) {
+		var remaining []Upload
+		for fn, id := range bestStr {
+			if !taken[fn] {
+				for _, u := range uploads {
+					if u.Filename == fn && u.UploadID == id {
+						remaining = append(remaining, u)
+						break
+					}
+				}
+			}
+		}
+		sort.Slice(remaining, func(i, j int) bool { return remaining[i].Filename < remaining[j].Filename })
+		out = append(out, remaining...)
+	}
+	return out
+}
+
+// extractUploadEntry walks a <div class="upload"> node and extracts the
+// filename (from <strong class="name">) and upload ID (from data-upload_id).
+func extractUploadEntry(div *html.Node) (Upload, bool) {
+	var uploadID, filename string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			if n.Data == "a" {
+				for _, a := range n.Attr {
+					if a.Key == "data-upload_id" && a.Val != "" {
+						uploadID = a.Val
+					}
+				}
+			}
+			if n.Data == "strong" && nodeHasClass(n, "name") {
+				// Prefer title attribute; fall back to text content
+				for _, a := range n.Attr {
+					if a.Key == "title" && a.Val != "" {
+						filename = a.Val
+					}
+				}
+				if filename == "" && n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
+					filename = strings.TrimSpace(n.FirstChild.Data)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(div)
+	if uploadID == "" || filename == "" {
+		return Upload{}, false
+	}
+	version := ""
+	var text strings.Builder
+	var collect func(*html.Node)
+	collect = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			text.WriteString(n.Data + " ")
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			collect(c)
+		}
+	}
+	collect(div)
+	if m := uploadVersionRe.FindStringSubmatch(text.String()); m != nil {
+		version = strings.TrimRight(m[1], ".-_")
+	}
+	return Upload{Filename: filename, UploadID: uploadID, Version: version}, true
+}
+
+// nodeHasClass reports whether an element node has the given CSS class.
+func nodeHasClass(n *html.Node, class string) bool {
+	for _, a := range n.Attr {
+		if a.Key == "class" {
+			for _, c := range strings.Fields(a.Val) {
+				if c == class {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

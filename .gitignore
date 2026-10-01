@@ -1,0 +1,4 @@
+# Build outputs (built on the device with go build / build.sh)
+leaf-mlp1-poc/bin/
+rom-hacks/bin/*-arm64
+logs/
