@@ -72,7 +72,12 @@ func usesLibretroCore(command string) bool {
 // cores directory). Copying a template the firmware already uses keeps those
 // paths correct.
 func retroarchCommandTemplate(list *esSystemList, emulator string) (string, bool) {
-	var fallback string
+	// Best first: a template that takes the binary from %EMULATOR% fits any
+	// RetroArch; then one that names this exact binary; then anything. The
+	// emulator was ignored before, so a template hardcoding retroarch32 —
+	// and retroarch32's cores folder — could be used for retroarch.
+	names := regexp.MustCompile(`(^|[/\s'"])` + regexp.QuoteMeta(emulator) + `($|[\s'"])`)
+	var named, fallback string
 	for _, sys := range list.Systems {
 		candidates := []string{sys.Command}
 		for _, emu := range sys.Emulators {
@@ -82,15 +87,19 @@ func retroarchCommandTemplate(list *esSystemList, emulator string) (string, bool
 			if !usesLibretroCore(cmd) {
 				continue
 			}
-			// Prefer a template already written for this exact emulator
-			// binary, so retroarch32's core path is not used for retroarch.
 			if strings.Contains(cmd, "%EMULATOR%") {
 				return cmd, true
+			}
+			if named == "" && emulator != "" && names.MatchString(cmd) {
+				named = cmd
 			}
 			if fallback == "" {
 				fallback = cmd
 			}
 		}
+	}
+	if named != "" {
+		return named, true
 	}
 	return fallback, fallback != ""
 }
@@ -164,7 +173,8 @@ func launchCommandFor(system, romPath string) (string, error) {
 		// with whatever ES is set to" true — otherwise PICO-8 carts always
 		// launched the first listed entry (pico8.sh) even when the user had
 		// selected the fake08 RetroArch core in the menu.
-		if chosenEmu, chosenCore, ok := esUserChoice(system); ok {
+		chosenEmu, chosenCore, ok := esUserChoice(system)
+		if ok {
 			if chosenEmu != "" {
 				emulator = chosenEmu
 				// Re-pair the core with the chosen emulator: the settings
@@ -181,7 +191,9 @@ func launchCommandFor(system, romPath string) (string, error) {
 		// Nestopia build shipped with dArkOS, while FCEUmm (RA's reference
 		// NES core) works. When the user has not picked a core in
 		// EmulationStation, prefer an achievement-capable one if installed.
-		if _, _, explicit := esUserChoice(system); !explicit {
+		// Picking only an emulator is not picking a core: that case used
+		// to skip the swap and launch Nestopia anyway.
+		if chosenCore == "" {
 			if better, ok := raFriendlyCore(system, core, command); ok {
 				fmt.Fprintf(os.Stderr, "system %s: using core %q for RetroAchievements (instead of %q)\n", system, better, core)
 				core = better

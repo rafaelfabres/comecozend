@@ -14,9 +14,11 @@ package main
 // same whether or not an itch.io page has been found for it yet.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -864,6 +866,80 @@ func (h *hubContext) install(ctx context.Context, inv *inventory.Inventory, g ra
 	return res, nil
 }
 
+// moveInstalledFile moves an installed game into destDir and returns where
+// it ended up.
+//
+// A file of the same name may already be there. Only when it holds the
+// same bytes is the old copy a duplicate to drop; before, the old file was
+// deleted on the name alone, and a different file that happened to share
+// it — another game's release, an older build — was all that remained.
+// A different file keeps its place and the moved one takes a free name.
+func moveInstalledFile(old, destDir string) (string, error) {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return "", err
+	}
+	base := filepath.Base(old)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 1; ; i++ {
+		target := filepath.Join(destDir, base)
+		if i > 1 {
+			target = filepath.Join(destDir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		}
+		if _, err := os.Stat(target); err != nil {
+			return target, os.Rename(old, target)
+		}
+		if same, err := sameContent(old, target); err == nil && same {
+			return target, os.Remove(old)
+		}
+		if i == 100 {
+			return "", fmt.Errorf("no free name for %s in %s", base, destDir)
+		}
+	}
+}
+
+// sameContent reports whether two files hold the same bytes.
+func sameContent(a, b string) (bool, error) {
+	ia, err := os.Stat(a)
+	if err != nil {
+		return false, err
+	}
+	ib, err := os.Stat(b)
+	if err != nil {
+		return false, err
+	}
+	if ia.Size() != ib.Size() {
+		return false, nil
+	}
+	fa, err := os.Open(a)
+	if err != nil {
+		return false, err
+	}
+	defer fa.Close()
+	fb, err := os.Open(b)
+	if err != nil {
+		return false, err
+	}
+	defer fb.Close()
+	bufA, bufB := make([]byte, 64<<10), make([]byte, 64<<10)
+	for {
+		na, errA := io.ReadFull(fa, bufA)
+		nb, errB := io.ReadFull(fb, bufB)
+		if na != nb || !bytes.Equal(bufA[:na], bufB[:nb]) {
+			return false, nil
+		}
+		if errA == io.EOF || errA == io.ErrUnexpectedEOF {
+			return errB == io.EOF || errB == io.ErrUnexpectedEOF, nil
+		}
+		if errA != nil {
+			return false, errA
+		}
+		if errB != nil {
+			return false, errB
+		}
+	}
+}
+
 // moveIntoItchioFolders moves games an earlier version installed straight
 // into /roms/<system>/ into /roms/<system>/itchio/, and fixes the hub state,
 // the inventory and gamelist.xml to match.
@@ -880,14 +956,8 @@ func (h *hubContext) moveIntoItchioFolders(inv *inventory.Inventory) {
 			continue // already where it belongs
 		}
 		old := st.InstalledPath
-		target := filepath.Join(dest.Dir, filepath.Base(old))
-		if err := os.MkdirAll(dest.Dir, 0o755); err != nil {
-			fmt.Fprintln(os.Stderr, "could not create", dest.Dir, err)
-			continue
-		}
-		if _, err := os.Stat(target); err == nil {
-			os.Remove(old) // already there (same name): drop the duplicate
-		} else if err := os.Rename(old, target); err != nil {
+		target, err := moveInstalledFile(old, dest.Dir)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "could not move %s: %v\n", old, err)
 			continue
 		}
