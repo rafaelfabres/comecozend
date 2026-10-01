@@ -207,26 +207,13 @@ func applyBPSFile(patchData []byte, srcPath, dstPath string, progress Progress) 
 				return err
 			}
 			dstRel += off
-			if dstRel < 0 || dstRel >= int64(dstSize) {
-				return errors.New("bps: target copy out of range")
+			if dstRel < 0 || dstRel >= outPos {
+				return errors.New("bps: target copy reads past what has been written")
 			}
-			// One byte at a time, through the file: the ranges can
-			// overlap, and that overlap is how BPS encodes run fills. The
-			// bytes being read may still be in the OS write buffer, so
-			// the file is flushed to keep ReadAt honest.
-			for i := 0; i < length; i++ {
-				var b [1]byte
-				if dstRel >= outPos {
-					return errors.New("bps: target copy reads past what has been written")
-				}
-				if _, err := dst.ReadAt(b[:], dstRel); err != nil {
-					return fmt.Errorf("bps: target copy: %w", err)
-				}
-				if err := write(b[:]); err != nil {
-					return err
-				}
-				dstRel++
+			if err := targetCopy(dst, buf, dstRel, outPos-dstRel, length, write); err != nil {
+				return err
 			}
+			dstRel += int64(length)
 		}
 	}
 
@@ -240,6 +227,52 @@ func applyBPSFile(patchData []byte, srcPath, dstPath string, progress Progress) 
 		progress(outPos, int64(dstSize))
 	}
 	ok = true
+	return nil
+}
+
+// targetCopy writes length bytes read back from the target starting at
+// from, where period = outPos - from is how far behind the write head that
+// is. When period < length the ranges overlap, and the overlap is the
+// point: it is how BPS encodes a run fill. The output is then the first
+// period bytes repeated, so they are read once and written as a pattern.
+//
+// This used to go one byte at a time, a read and a write syscall per byte,
+// which on a 600 MB disc full of long fills took many minutes.
+func targetCopy(dst *os.File, buf []byte, from, period int64, length int, write func([]byte) error) error {
+	if period >= int64(length) || period >= int64(len(buf)) {
+		// No overlap, or none within one buffer: copied in chunks no
+		// longer than period, each read stays behind the write head.
+		for length > 0 {
+			n := min(length, len(buf))
+			if _, err := dst.ReadAt(buf[:n], from); err != nil {
+				return fmt.Errorf("bps: target copy: %w", err)
+			}
+			if err := write(buf[:n]); err != nil {
+				return err
+			}
+			from += int64(n)
+			length -= n
+		}
+		return nil
+	}
+	// Overlap with a short period: smaller than the buffer.
+	pattern := make([]byte, period)
+	if _, err := dst.ReadAt(pattern, from); err != nil {
+		return fmt.Errorf("bps: target copy: %w", err)
+	}
+	// Tile the pattern to a whole number of repeats, so every chunk
+	// written starts at the pattern's first byte.
+	fill := buf[:0]
+	for len(fill)+len(pattern) <= len(buf) {
+		fill = append(fill, pattern...)
+	}
+	for length > 0 {
+		n := min(length, len(fill))
+		if err := write(fill[:n]); err != nil {
+			return err
+		}
+		length -= n
+	}
 	return nil
 }
 
@@ -272,9 +305,13 @@ func applyIPSFile(patchData []byte, srcPath, dstPath string) error {
 		if string(patchData[pos:pos+3]) == "EOF" {
 			pos += 3
 			if pos+3 <= len(patchData) {
+				// Truncation only ever shortens, as in the in-memory
+				// path: a record past the end used to grow the file.
 				if n := int64(be24(patchData[pos : pos+3])); n > 0 {
-					if err := dst.Truncate(n); err != nil {
-						return err
+					if info, err := dst.Stat(); err == nil && n < info.Size() {
+						if err := dst.Truncate(n); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -319,7 +356,7 @@ func applyIPSFile(patchData []byte, srcPath, dstPath string) error {
 // --- xdelta -----------------------------------------------------------
 
 func applyXDeltaFile(patchData []byte, srcPath, dstPath string) error {
-	dir, err := os.MkdirTemp("", "xdelta")
+	dir, err := xdeltaWorkDir()
 	if err != nil {
 		return err
 	}

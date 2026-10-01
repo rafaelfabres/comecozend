@@ -120,3 +120,25 @@ func TestInstallDiscRemovesEverythingOnMismatch(t *testing.T) {
 		t.Errorf("left behind: %v", files)
 	}
 }
+
+// xdelta3's working folders are staged on the card too, so a killed run
+// leaves folders as well as files; the startup sweep clears both, and
+// nothing that is not the app's.
+func TestSweepStagingClearsXDeltaFolders(t *testing.T) {
+	old := TempDir
+	TempDir = t.TempDir()
+	t.Cleanup(func() { TempDir = old })
+
+	os.WriteFile(filepath.Join(TempDir, "patch-123.zip"), []byte("x"), 0o644)
+	os.MkdirAll(filepath.Join(TempDir, "patch-xdelta-456"), 0o755)
+	os.WriteFile(filepath.Join(TempDir, "patch-xdelta-456", "source.bin"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(TempDir, "keep.txt"), []byte("x"), 0o644)
+
+	if n, _ := SweepStaging(); n != 2 {
+		t.Errorf("removed %d entries, want 2", n)
+	}
+	entries, _ := os.ReadDir(TempDir)
+	if len(entries) != 1 || entries[0].Name() != "keep.txt" {
+		t.Errorf("left: %v", entries)
+	}
+}

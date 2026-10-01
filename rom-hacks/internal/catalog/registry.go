@@ -27,7 +27,10 @@ type Record struct {
 // together. Writing down the game ID at install time removes the guessing
 // entirely.
 type Registry struct {
-	mu     sync.RWMutex
+	mu sync.RWMutex
+	// saveMu keeps two saves from sharing the temporary file: the install
+	// worker and the SDL thread (Delete, Prune) can both save.
+	saveMu sync.Mutex
 	byGame map[int]Record
 	path   string
 }
@@ -121,6 +124,8 @@ func (r *Registry) All() []Record {
 }
 
 func (r *Registry) Save() error {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
 	records := r.All()
 	b, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {

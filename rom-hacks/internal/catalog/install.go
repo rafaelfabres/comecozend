@@ -449,10 +449,19 @@ func applyUntilSupported(p *Plan, source []byte, console rahub.Console) ([]byte,
 	var firstHash string
 	var firstErr error
 	for _, f := range candidates {
-		if patch.Detect(f.Bytes()) == patch.Unknown {
+		// Read once per candidate: f is a copy, so Bytes() would not
+		// keep what it read, and a 70 MB patch was decompressed twice.
+		data, err := f.Load()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
-		out, err := patch.ApplyAny(f.Bytes(), source)
+		if patch.Detect(data) == patch.Unknown {
+			continue
+		}
+		out, err := patch.ApplyAny(data, source)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -544,14 +553,22 @@ func SweepStaging() (removed int, bytes int64) {
 		return 0, 0
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "patch-") {
+		if !strings.HasPrefix(e.Name(), "patch-") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			// xdelta3's working folders (patch-xdelta-*).
+			if os.RemoveAll(path) == nil {
+				removed++
+			}
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+		if os.Remove(path) == nil {
 			removed++
 			bytes += info.Size()
 		}

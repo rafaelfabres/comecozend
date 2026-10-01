@@ -36,6 +36,7 @@ import (
 	"leaf-hacks/internal/catalog"
 	"leaf-hacks/internal/esmeta"
 	"leaf-hacks/internal/library"
+	"leaf-hacks/internal/patch"
 	"leaf-hacks/internal/rahub"
 	"leaf-hacks/internal/sdlui"
 )
@@ -103,6 +104,7 @@ func main() {
 
 	cfg := loadConfig()
 	catalog.TempDir = stagingDir()
+	patch.TempDir = catalog.TempDir
 	// Nothing is downloading at startup, so anything still staged is
 	// debris from a run that was killed before it could tidy up.
 	if n, bytes := catalog.SweepStaging(); n > 0 {

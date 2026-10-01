@@ -32,11 +32,22 @@ func xdeltaPath() (string, error) {
 	return exec.LookPath("xdelta3")
 }
 
+// TempDir is where xdelta3's working files go: the source ROM, the patch
+// and the output, each up to tens of megabytes. Left empty they went to
+// /tmp, which on these handhelds is a tmpfs — RAM. The app points this at
+// its staging folder on the card; names start with "patch-" so the
+// startup sweep clears what a killed run left.
+var TempDir = ""
+
+func xdeltaWorkDir() (string, error) {
+	return os.MkdirTemp(TempDir, "patch-xdelta-")
+}
+
 // ApplyXDelta shells out to xdelta3 in a temporary directory and returns
 // the patched bytes. Unlike BPS it validates nothing itself, so the
 // caller's hash check against RetroAchievements is the only guarantee.
 func ApplyXDelta(patchData, source []byte) ([]byte, error) {
-	dir, err := os.MkdirTemp("", "xdelta")
+	dir, err := xdeltaWorkDir()
 	if err != nil {
 		return nil, err
 	}
