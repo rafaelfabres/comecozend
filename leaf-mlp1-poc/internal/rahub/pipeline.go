@@ -181,6 +181,23 @@ func (p *Pipeline) Resolve(ctx context.Context, g HubGame, force bool) ([]Candid
 			pool = append(pool, res...)
 		}
 	}
+	// Still nothing: the developer may have written two words of the title
+	// as one ("RingDash GBA" for RA's "Ring Dash GBA"), which a word-based
+	// search does not find. One more query, with the first pair joined.
+	if st.Override == "" && len(RankForTitles(titles, console, hints, pool, p.MinScore, 1)) == 0 {
+		if joined := JoinedTitles(clean); len(joined) > 0 {
+			if err := sleepCtx(ctx, p.SearchDelay/2); err != nil {
+				return nil, err
+			}
+			if res, err := p.Itch.Search(ctx, joined[0]); err == nil {
+				pool = append(pool, res...)
+			} else if ctx.Err() != nil {
+				return nil, ctx.Err()
+			} else {
+				searchErr = err
+			}
+		}
+	}
 	ranked := RankForTitles(titles, console, hints, pool, p.MinScore, p.MaxCandidates)
 	if len(ranked) == 0 && st.Override == "" {
 		// Nothing confirmed yet. Search cells carry little text, so open the

@@ -17,7 +17,7 @@ import (
 
 // SearchVersion is bumped whenever the lookup gets new ways to find a page.
 // Games recorded as NOT_FOUND by an older version are looked up again.
-const SearchVersion = 14
+const SearchVersion = 15 // 15: titles that differ only in spacing ("Ring Dash" / "RingDash")
 
 // itchGameURL matches an itch.io game page: https://<user>.itch.io/<game>.
 var itchGameURL = regexp.MustCompile(`https?://([a-z0-9][a-z0-9_-]*)\.itch\.io/([a-z0-9][a-z0-9_-]*)/?(?:[?#"'&<\s]|$)`)
@@ -102,6 +102,32 @@ func TitleSlugs(title string) []string {
 	out := []string{strings.Join(words, "-")}
 	if len(words) > 1 {
 		out = append(out, strings.Join(words, ""))
+	}
+	// Two words of the title written as one, as developers often name
+	// their games: RA's "Ring Dash GBA" is brig78cx.itch.io/ringdash-gba.
+	if len(words) > 2 && len(words) <= 5 {
+		for i := 0; i+1 < len(words); i++ {
+			joined := append(append(append([]string(nil), words[:i]...), words[i]+words[i+1]), words[i+2:]...)
+			out = append(out, strings.Join(joined, "-"))
+		}
+	}
+	return out
+}
+
+// JoinedTitles returns the title with two neighbouring words written as
+// one — "Ring Dash GBA" → "RingDash GBA", "Ring DashGBA" — for searches.
+// itch.io's search, like the title comparison, works on whole words, so a
+// game published as "RingDash" is not found by "Ring Dash". Only short
+// titles: past five words a joined pair is a guess too far.
+func JoinedTitles(clean string) []string {
+	words := strings.Fields(clean)
+	if len(words) < 2 || len(words) > 5 {
+		return nil
+	}
+	var out []string
+	for i := 0; i+1 < len(words); i++ {
+		joined := append(append(append([]string(nil), words[:i]...), words[i]+words[i+1]), words[i+2:]...)
+		out = append(out, strings.Join(joined, " "))
 	}
 	return out
 }

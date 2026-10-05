@@ -1,3 +1,14 @@
+# v99 — títulos com espaçamento diferente
+
+- Jogos publicados no itch.io com duas palavras juntas agora são achados:
+  o RA chama de "Ring Dash GBA", o itch.io de "RingDash GBA"
+  (brig78cx.itch.io/ringdash-gba). Antes a comparação era palavra por
+  palavra, os dois só tinham "gba" em comum, e o jogo ficava "not in itch".
+- Se a busca normal não acha nada, o app tenta também o título com as
+  primeiras palavras juntas, e o endereço adivinhado inclui essa forma
+  (`ringdash-gba`).
+- Jogos que estavam "not in itch" são procurados de novo sozinhos.
+
 # v98 — correções de bugs
 
 - Mover jogos para a pasta `itchio/` não apaga mais o jogo quando já

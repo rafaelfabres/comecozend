@@ -158,8 +158,14 @@ func scoreLoose(raTitle string, console Console, developers []string, c Candidat
 	switch {
 	case got == want:
 		score, reason = 100, "exact title"
+	case strings.ReplaceAll(got, " ", "") == strings.ReplaceAll(want, " ", ""):
+		// Only the spacing differs: RA's "Ring Dash GBA" is the page's
+		// "RingDash GBA". Compared word by word they shared just "gba".
+		score, reason = 100, "same title, spaced differently"
 	case got == wantMain || NormTitle(MainTitle(c.Title)) == want:
 		score, reason = 80, "title without subtitle"
+	case strings.ReplaceAll(got, " ", "") == strings.ReplaceAll(wantMain, " ", ""):
+		score, reason = 80, "title without subtitle, spaced differently"
 	case containsWords(got, want) || containsWords(want, got):
 		score, reason = 50, "title contains the other"
 	case allWords(want, got):
